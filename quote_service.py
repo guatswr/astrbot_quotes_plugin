@@ -550,6 +550,56 @@ class QuoteService:
         store = self.repository.get_store(session_key)
         return await asyncio.to_thread(store.clear_cache_files)
 
+    async def build_quote_list_text(
+        self,
+        session_key: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> str:
+        safe_page = max(1, int(page))
+        safe_page_size = max(1, min(50, int(page_size)))
+        offset = (safe_page - 1) * safe_page_size
+        total, quotes = await asyncio.to_thread(
+            self.repository.list_quotes_page,
+            session_key,
+            limit=safe_page_size,
+            offset=offset,
+        )
+        if total == 0:
+            return "这个会话的记忆库还是空的，先用 /上传 教教我吧！"
+
+        total_pages = (total + safe_page_size - 1) // safe_page_size
+        if safe_page > total_pages:
+            return f"页码超出范围：当前共有 {total_pages} 页、{total} 条语录。"
+
+        lines = [f"当前会话语录（第 {safe_page}/{total_pages} 页，共 {total} 条）："]
+        for index, quote in enumerate(quotes, start=offset + 1):
+            owner = quote.name or quote.qq or "未知用户"
+            owner_text = f"{owner}（{quote.qq}）" if quote.qq and quote.qq != owner else owner
+            lines.append(f"{index}. {owner_text}：{self._quote_list_summary(quote)}")
+        if safe_page < total_pages:
+            lines.append(f"发送 /语录列表 {safe_page + 1} 查看下一页。")
+        return "\n".join(lines)
+
+    def _quote_list_summary(self, quote: Quote, max_length: int = 56) -> str:
+        text = " ".join(str(quote.text or "").split())
+        if len(text) > max_length:
+            text = f"{text[: max_length - 1]}…"
+        if quote.kind == "forward":
+            count = len(quote.forward_nodes)
+            detail = f"聊天记录，共 {count} 个节点"
+            return f"[{detail}] {text}" if text else f"[{detail}]"
+
+        image_count = sum(
+            1
+            for segment in quote.segments
+            if segment.type == "image" and segment.asset_id
+        )
+        if image_count:
+            image_label = f"[图片×{image_count}]"
+            return f"{text} {image_label}" if text else image_label
+        return text or "[无文本内容]"
+
     async def shutdown(self) -> None:
         tasks = [task for task in self._render_tasks if not task.done()]
         for task in tasks:

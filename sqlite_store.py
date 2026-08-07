@@ -449,6 +449,33 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             ).fetchall()
         return [self._row_to_quote(row) for row in rows]
 
+    def list_quotes_page(
+        self,
+        session_key: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[int, list[Quote]]:
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        with self._connection() as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quotes WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM quotes
+                WHERE session_key = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (session_key, safe_limit, safe_offset),
+            ).fetchall()
+        return total, [self._row_to_quote(row) for row in rows]
+
     def list_quotes_for_owner(self, session_key: str, qq: str) -> list[Quote]:
         with self._connection() as connection:
             rows = connection.execute(

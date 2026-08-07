@@ -185,6 +185,53 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             )
             await service.shutdown()
 
+    async def test_quote_list_is_paginated_and_summarized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = QuoteRepository(root)
+            for index in range(11):
+                quote = Quote(
+                    id=f"q_list_{index:02d}",
+                    qq="10001",
+                    name="测试用户",
+                    text=f"第 {index} 条语录",
+                    created_by="20002",
+                    created_at=float(index),
+                    group="123456",
+                    content_fingerprint=f"list-fingerprint-{index}",
+                )
+                await repository.create_quote_with_segments(
+                    "123456",
+                    quote,
+                    [PendingQuoteSegment(type="text", text=quote.text)],
+                )
+            service = QuoteService(
+                repository=repository,
+                image_service=FakeImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=CapturingRenderer(root / "unused.png"),
+                http_client=None,
+                global_mode=True,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+
+            first_page = await service.build_quote_list_text("123456")
+            second_page = await service.build_quote_list_text("123456", page=2)
+
+            self.assertIn("第 1/2 页，共 11 条", first_page)
+            self.assertIn("1. 测试用户（10001）：第 10 条语录", first_page)
+            self.assertIn("发送 /语录列表 2 查看下一页", first_page)
+            self.assertIn("第 2/2 页，共 11 条", second_page)
+            self.assertIn("11. 测试用户（10001）：第 0 条语录", second_page)
+            self.assertEqual(
+                await service.build_quote_list_text("123456", page=3),
+                "页码超出范围：当前共有 2 页、11 条语录。",
+            )
+            await service.shutdown()
+
     async def test_upload_pre_renders_all_global_binding_signatures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

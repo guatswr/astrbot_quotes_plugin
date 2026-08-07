@@ -75,6 +75,36 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             connection.close()
 
+    async def test_lists_quotes_by_newest_page(self) -> None:
+        repository = QuoteRepository(self.root)
+        for index in range(12):
+            quote = Quote(
+                id=f"q_page_{index:02d}",
+                qq="10001",
+                name="测试用户",
+                text=f"第 {index} 条",
+                created_by="20002",
+                created_at=float(index),
+                group="123456",
+                content_fingerprint=f"page-fingerprint-{index}",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+
+        total, quotes = repository.list_quotes_page(
+            "123456",
+            limit=5,
+            offset=5,
+        )
+        self.assertEqual(total, 12)
+        self.assertEqual(
+            [quote.id for quote in quotes],
+            ["q_page_06", "q_page_05", "q_page_04", "q_page_03", "q_page_02"],
+        )
+
     async def test_migrates_session_json_and_keeps_backup(self) -> None:
         session_dir = self.root / "groups" / "778899"
         session_dir.mkdir(parents=True)
