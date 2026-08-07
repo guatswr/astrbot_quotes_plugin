@@ -4,9 +4,10 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import quote_service as quote_service_module
-from models import PendingQuoteSegment, Quote
+from models import PendingQuoteSegment, Quote, QuoteSegment
 from quote_service import QuoteService
 from sqlite_store import QuoteRepository
 
@@ -33,6 +34,19 @@ class SegmentEvent:
 class FakePlain:
     def __init__(self, text: str):
         self.text = text
+
+
+class FakeImage:
+    def __init__(self, file: str):
+        self.file = file
+
+    @staticmethod
+    def fromURL(url: str) -> "FakeImage":
+        return FakeImage(url)
+
+    @staticmethod
+    def fromFileSystem(path: str) -> "FakeImage":
+        return FakeImage(str(Path(path).resolve()))
 
 
 class FakeImageService:
@@ -105,6 +119,82 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(service.extract_exact_plain_text(SegmentEvent([])))
         finally:
             quote_service_module.Comp = original_components
+
+    def test_plain_quote_response_includes_sender_avatar(self) -> None:
+        original_components = quote_service_module.Comp
+        quote_service_module.Comp = type(
+            "Components",
+            (),
+            {"Plain": FakePlain, "Image": FakeImage},
+        )
+        service = object.__new__(QuoteService)
+        quote = Quote(
+            id="q_text_avatar",
+            qq="10001",
+            name="原昵称",
+            text="纯文字语录",
+            created_by="20002",
+            created_at=1.0,
+            group="123456",
+        )
+        try:
+            response = service._plain_quote_response(quote, "名言")
+
+            self.assertEqual(response.kind, "chain")
+            self.assertEqual(len(response.chain), 2)
+            self.assertEqual(
+                response.chain[0].file,
+                "https://q1.qlogo.cn/g?b=qq&nk=10001&s=100",
+            )
+            self.assertEqual(response.chain[1].text, "「纯文字语录」 — 名言")
+        finally:
+            quote_service_module.Comp = original_components
+
+    async def test_image_quote_chain_appends_bound_sender_id(self) -> None:
+        original_components = quote_service_module.Comp
+        quote_service_module.Comp = type(
+            "Components",
+            (),
+            {"Plain": FakePlain, "Image": FakeImage},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "quote.png"
+            image_path.write_bytes(b"fake-png")
+            service = object.__new__(QuoteService)
+            service.repository = SimpleNamespace(
+                root=root,
+                find_assets=lambda group, image_ids: {
+                    "asset-1": SimpleNamespace(rel_path="quote.png")
+                },
+            )
+            quote = Quote(
+                id="q_image_sender",
+                qq="10001",
+                name="原昵称",
+                text="",
+                created_by="20002",
+                created_at=1.0,
+                group="123456",
+                image_ids=["asset-1"],
+                segments=[QuoteSegment(type="image", asset_id="asset-1")],
+            )
+            try:
+                chain = service.build_standard_quote_chain(quote, "名言")
+                service.http_client = None
+
+                self.assertEqual(len(chain), 2)
+                self.assertIsInstance(chain[0], FakeImage)
+                self.assertEqual(chain[1].text, "\n— 名言")
+                self.assertEqual(
+                    await service.build_delete_fingerprint(quote, chain=chain),
+                    await service._fingerprint_standard_chain(chain),
+                )
+
+                unbound_chain = service.build_standard_quote_chain(quote)
+                self.assertEqual(unbound_chain[-1].text, "\n— 10001")
+            finally:
+                quote_service_module.Comp = original_components
 
     async def test_upload_returns_before_background_render_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

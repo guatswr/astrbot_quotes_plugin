@@ -322,7 +322,7 @@ class QuoteService:
                 effective_signature = binding.tag
 
         logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
-        chain = self.build_quote_chain(quote)
+        chain = self.build_quote_chain(quote, effective_signature)
         if chain:
             return CommandResponse(
                 kind="chain",
@@ -333,13 +333,7 @@ class QuoteService:
             )
 
         if self.text_mode or quote.kind == "forward" or self.renderer.should_fallback_to_plain(quote):
-            text = self._quote_plain_fallback(quote, effective_signature)
-            return CommandResponse(
-                kind="plain",
-                text=text,
-                quote_id=quote.id,
-                delete_fingerprint=self._fingerprint_plain_text(text),
-            )
+            return self._plain_quote_response(quote, effective_signature)
 
         store = self.repository.get_store(quote.group)
         cache_path = store.cache_path(quote.id, effective_signature)
@@ -375,16 +369,10 @@ class QuoteService:
             )
         except asyncio.TimeoutError:
             logger.info(
-                f"语录冷渲染超过等待预算，回退纯文本: quote_id={quote.id}, "
+                f"语录冷渲染超过等待预算，回退头像文本消息: quote_id={quote.id}, "
                 f"timeout={self.render_wait_timeout}s"
             )
-            text = self._quote_plain_fallback(quote, effective_signature)
-            return CommandResponse(
-                kind="plain",
-                text=text,
-                quote_id=quote.id,
-                delete_fingerprint=self._fingerprint_plain_text(text),
-            )
+            return self._plain_quote_response(quote, effective_signature)
         if cached:
             return CommandResponse(
                 kind="image_path",
@@ -392,13 +380,7 @@ class QuoteService:
                 quote_id=quote.id,
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
             )
-        text = self._quote_plain_fallback(quote, effective_signature)
-        return CommandResponse(
-            kind="plain",
-            text=text,
-            quote_id=quote.id,
-            delete_fingerprint=self._fingerprint_plain_text(text),
-        )
+        return self._plain_quote_response(quote, effective_signature)
 
     def _upload_success_text(self, detail: str) -> str:
         return f"{detail}\n{UPLOAD_SUCCESS_PROMPT}"
@@ -789,14 +771,14 @@ class QuoteService:
         logger.info(f"删除语录定位失败: 指纹未匹配 sent_index, session={session_key}")
         return None
 
-    def build_quote_chain(self, quote: Quote) -> list[Any]:
+    def build_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
         if Comp is None:
             return []
         if quote.kind == "forward":
             return self.build_forward_quote_chain(quote)
-        return self.build_standard_quote_chain(quote)
+        return self.build_standard_quote_chain(quote, sender_id)
 
-    def build_standard_quote_chain(self, quote: Quote) -> list[Any]:
+    def build_standard_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
         if not quote.segments:
             return []
         has_image = any(segment.type == "image" and segment.asset_id for segment in quote.segments)
@@ -819,6 +801,10 @@ class QuoteService:
             abs_path = self.repository.root / asset.rel_path
             if abs_path.exists():
                 chain.append(Comp.Image.fromFileSystem(str(abs_path)))
+        if chain:
+            identifier = str(sender_id or quote.qq or quote.name).strip()
+            if identifier:
+                chain.append(Comp.Plain(f"\n— {identifier}"))
         return chain
 
     def build_forward_quote_chain(self, quote: Quote) -> list[Any]:
@@ -1084,9 +1070,42 @@ class QuoteService:
             return quote.text or f"{quote.name} 的聊天记录语录"
         return f"「{quote.text}」 — {signature or quote.name}"
 
+    def _plain_quote_response(self, quote: Quote, signature: str = "") -> CommandResponse:
+        text = self._quote_plain_fallback(quote, signature)
+        chain: list[Any] = []
+        if Comp is not None and quote.kind == "standard":
+            qq = str(quote.qq or "").strip()
+            if qq:
+                try:
+                    chain.append(Comp.Image.fromURL(self._quote_avatar_url(qq)))
+                except Exception as exc:
+                    logger.info(f"构造语录头像组件失败，回退纯文本: qq={qq}, error={exc}")
+            chain.append(Comp.Plain(text))
+        if chain:
+            return CommandResponse(
+                kind="chain",
+                chain=chain,
+                quote_id=quote.id,
+                delete_fingerprint=self._fingerprint_plain_text(text),
+            )
+        return CommandResponse(
+            kind="plain",
+            text=text,
+            quote_id=quote.id,
+            delete_fingerprint=self._fingerprint_plain_text(text),
+        )
+
+    def _quote_avatar_url(self, qq: str) -> str:
+        return f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
+
     async def build_delete_fingerprint(self, quote: Quote, *, chain: list[Any] | None = None) -> str:
         if quote.kind == "forward":
             return self._fingerprint_forward_nodes(quote.group, quote.forward_nodes)
+
+        if chain and len(chain) > 1:
+            fingerprint = await self._fingerprint_standard_chain(chain)
+            if fingerprint:
+                return fingerprint
 
         single_image = self._single_standard_image_signature(quote)
         if single_image is not None:
@@ -1126,6 +1145,9 @@ class QuoteService:
         if not normalized:
             return "", None
 
+        if self._is_avatar_text_quote(normalized):
+            return self._fingerprint_plain_text(normalized[-1].text), None
+
         if len(normalized) == 1 and normalized[0].type == "image" and normalized[0].image is not None:
             return self._fingerprint_image_sha(normalized[0].image.sha256), normalized[0].image
 
@@ -1141,6 +1163,15 @@ class QuoteService:
             ),
             None,
         )
+
+    def _is_avatar_text_quote(self, segments: list[Any]) -> bool:
+        if len(segments) != 2:
+            return False
+        image_segment, text_segment = segments
+        if image_segment.type != "image" or text_segment.type != "text":
+            return False
+        text = normalize_quote_text(str(text_segment.text or ""))
+        return text.startswith("「") and "」 — " in text
 
     def _fingerprint_plain_text(self, text: str) -> str:
         normalized = self._canonical_text(normalize_quote_text(text))
