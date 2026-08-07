@@ -85,6 +85,9 @@
 | `image.text_color` | 字符串 | `"#fff"` | 语录卡片文字颜色 |
 | `image.font_family` | 字符串 | 系统默认 | 语录卡片字体 |
 | `image_signature_use_group` | 布尔 | `false` | 语录图片签名使用群名片而非 QQ 昵称 |
+| `performance.text_mode` | 布尔 | `false` | 纯文字语录直接发送文本，不渲染卡片 |
+| `performance.render_cache` | 布尔 | `true` | 上传纯文字语录后在后台预渲染并缓存卡片 |
+| `performance.render_wait_timeout` | 浮点数 | `0.8` | 冷缓存最多等待秒数，超时先发送纯文本 |
 | `poke_enabled` | 布尔 | `false` | 启用戳一戳触发随机语录 |
 | `poke_probability` | 整数 | `20` | 戳一戳触发概率（0-100） |
 | `poke_group_whitelist` | 列表 | `[]` | 戳一戳触发的群白名单（留空不限制） |
@@ -96,21 +99,20 @@
 
 ```
 quotes/
+├── quotes.sqlite3              # 语录、资源元数据与已发送指纹索引
 └── groups/
     └── {session_key}/          # 群号 或 private_QQ号
-        ├── quotes.json         # 语录数据
-        ├── image_index.json    # 图片资源索引
-        ├── media_index.json    # 语音/视频/文件资源索引
-        ├── sent_index.json     # 已发送语录指纹索引（用于精确删除）
         ├── images/             # 图片文件
         ├── media/              # 聊天记录中的语音/视频/文件
-        └── cache/              # 渲染缓存
+        └── cache/              # 后台预渲染缓存
 ```
 
 - 每个群/私聊会话拥有独立的数据目录
 - `global_mode` 仅影响查询范围，不改变物理落盘目录
 - 聊天记录语录中的图片仍进入 `images/`，语音/视频/文件进入 `media/`，都按会话独立管理
-- 首次启动时自动迁移旧版单文件数据格式，并备份为 `quotes.json.bak`
+- SQLite 使用 WAL 模式，并通过事务同步更新语录、资源索引和引用计数
+- 首次启动时自动导入旧版根目录 `quotes.json` 和分会话 JSON 数据
+- 根目录旧文件备份为 `quotes.json.bak`；分会话 JSON 备份为 `*.json.migrated.bak`
 
 ## 重复图片检测
 

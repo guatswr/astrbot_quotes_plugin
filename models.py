@@ -141,6 +141,7 @@ class Quote:
     media_ids: list[str] = field(default_factory=list)
     segments: list[QuoteSegment] = field(default_factory=list)
     forward_nodes: list[ForwardNode] = field(default_factory=list)
+    content_fingerprint: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Quote":
@@ -191,6 +192,7 @@ class Quote:
             media_ids=media_ids,
             segments=segments,
             forward_nodes=forward_nodes,
+            content_fingerprint=str(data.get("content_fingerprint") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -215,6 +217,7 @@ class Quote:
             "media_ids": self.media_ids,
             "segments": [segment.to_dict() for segment in self.segments],
             "forward_nodes": [node.to_dict() for node in self.forward_nodes],
+            "content_fingerprint": self.content_fingerprint,
         }
 
 

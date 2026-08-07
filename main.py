@@ -20,7 +20,7 @@ try:
     from .napcat_service import NapcatService
     from .quote_service import QuoteService
     from .renderer import QuoteRenderer
-    from .store import QuoteRepository
+    from .sqlite_store import QuoteRepository
     from .utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
 except ImportError:  # pragma: no cover
     from constants import PLUGIN_NAME
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     from napcat_service import NapcatService
     from quote_service import QuoteService
     from renderer import QuoteRenderer
-    from store import QuoteRepository
+    from sqlite_store import QuoteRepository
     from utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
 
 
@@ -53,6 +53,7 @@ class QuotesPlugin(Star):
             wake_prefixes=resolve_wake_prefixes(self._resolve_context_config()),
         )
         self.renderer = QuoteRenderer(self.html_render, self.config.get("image") or {})
+        performance_config = self.config.get("performance") or {}
         self.quote_service = QuoteService(
             repository=self.repository,
             image_service=self.image_service,
@@ -60,8 +61,11 @@ class QuotesPlugin(Star):
             renderer=self.renderer,
             http_client=self.http_client,
             global_mode=bool(self.config.get("global_mode", False)),
-            text_mode=bool((self.config.get("performance") or {}).get("text_mode", False)),
-            render_cache=bool((self.config.get("performance") or {}).get("render_cache", True)),
+            text_mode=bool(performance_config.get("text_mode", False)),
+            render_cache=bool(performance_config.get("render_cache", True)),
+            render_wait_timeout=self._parse_render_wait_timeout(
+                performance_config.get("render_wait_timeout", 0.8)
+            ),
             image_signature_use_group=bool(self.config.get("image_signature_use_group", False)),
             blacklist=self._parse_blacklist(),
         )
@@ -75,6 +79,7 @@ class QuotesPlugin(Star):
         await self.renderer.warmup()
 
     async def terminate(self):
+        await self.quote_service.shutdown()
         if self.http_client is not None:
             try:
                 await self.http_client.aclose()
@@ -236,6 +241,12 @@ class QuotesPlugin(Star):
             return max(0, min(100, int(value)))
         except (TypeError, ValueError):
             return 20
+
+    def _parse_render_wait_timeout(self, value: Any) -> float:
+        try:
+            return max(0.0, min(5.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.8
 
     def _parse_id_set(self, values: Any) -> set[str]:
         return {str(item).strip() for item in values if str(item).strip()}

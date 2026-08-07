@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -438,7 +439,12 @@ class ImageService:
     async def _prepare_image_from_url(self, url: str) -> PreparedImage | None:
         try:
             content, content_type = await self._fetch_bytes(url)
-            return prepare_image(content, source=url, content_type=content_type)
+            return await asyncio.to_thread(
+                prepare_image,
+                content,
+                source=url,
+                content_type=content_type,
+            )
         except Exception as exc:
             logger.warning(f"下载图片失败: {exc}")
             return None
@@ -448,7 +454,8 @@ class ImageService:
             file_path = self._normalize_path(path)
             if not file_path.exists():
                 return None
-            return prepare_image(file_path.read_bytes(), source=file_path.name)
+            content = await asyncio.to_thread(file_path.read_bytes)
+            return await asyncio.to_thread(prepare_image, content, source=file_path.name)
         except Exception as exc:
             logger.warning(f"读取本地图片失败: {exc}")
             return None
@@ -462,7 +469,8 @@ class ImageService:
     ) -> PreparedMedia | None:
         try:
             content, content_type = await self._fetch_bytes(url)
-            return prepare_media(
+            return await asyncio.to_thread(
+                prepare_media,
                 content,
                 media_type=media_type,
                 source=url,
@@ -484,8 +492,10 @@ class ImageService:
             file_path = self._normalize_path(path)
             if not file_path.exists():
                 return None
-            return prepare_media(
-                file_path.read_bytes(),
+            content = await asyncio.to_thread(file_path.read_bytes)
+            return await asyncio.to_thread(
+                prepare_media,
+                content,
                 media_type=media_type,
                 source=file_path.name,
                 display_name=display_name or file_path.name,

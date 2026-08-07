@@ -5,6 +5,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from time import time
 from typing import Any
 
 try:
@@ -517,7 +518,12 @@ class QuoteRepository:
             payload = read_json(legacy_quotes, {"quotes": []})
             legacy_quotes_list = payload.get("quotes") or []
             if not legacy_quotes_list:
-                legacy_quotes.rename(legacy_quotes.with_name(legacy_quotes.name + LEGACY_QUOTES_BAK_SUFFIX))
+                backup_path = legacy_quotes.with_name(legacy_quotes.name + LEGACY_QUOTES_BAK_SUFFIX)
+                if backup_path.exists():
+                    backup_path = legacy_quotes.with_name(
+                        legacy_quotes.name + f".{int(time() * 1000)}{LEGACY_QUOTES_BAK_SUFFIX}"
+                    )
+                legacy_quotes.rename(backup_path)
                 return False
 
             buckets: dict[str, dict[str, Any]] = defaultdict(
@@ -595,7 +601,9 @@ class QuoteRepository:
 
             backup_path = legacy_quotes.with_name(legacy_quotes.name + LEGACY_QUOTES_BAK_SUFFIX)
             if backup_path.exists():
-                backup_path.unlink()
+                backup_path = legacy_quotes.with_name(
+                    legacy_quotes.name + f".{int(time() * 1000)}{LEGACY_QUOTES_BAK_SUFFIX}"
+                )
             legacy_quotes.rename(backup_path)
             logger.info(f"已完成旧语录数据迁移，备份文件: {backup_path}")
             return True

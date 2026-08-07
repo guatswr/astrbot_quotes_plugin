@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -15,10 +17,17 @@ except Exception:  # pragma: no cover
 
 try:
     from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
-    from .models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
+    from .models import (
+        CommandResponse,
+        ForwardNode,
+        ForwardSegment,
+        ImageSignature,
+        Quote,
+        collect_forward_asset_ids,
+    )
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
-    from .store import QuoteRepository
+    from .sqlite_store import QuoteRepository
     from .utils import (
         is_valid_qq,
         make_session_key,
@@ -28,10 +37,17 @@ try:
     )
 except ImportError:  # pragma: no cover
     from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
-    from models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
+    from models import (
+        CommandResponse,
+        ForwardNode,
+        ForwardSegment,
+        ImageSignature,
+        Quote,
+        collect_forward_asset_ids,
+    )
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
-    from store import QuoteRepository
+    from sqlite_store import QuoteRepository
     from utils import (
         is_valid_qq,
         make_session_key,
@@ -55,6 +71,7 @@ class QuoteService:
         render_cache: bool,
         image_signature_use_group: bool,
         blacklist: set[str],
+        render_wait_timeout: float = 0.8,
     ):
         self.repository = repository
         self.image_service = image_service
@@ -64,8 +81,12 @@ class QuoteService:
         self.global_mode = global_mode
         self.text_mode = text_mode
         self.render_cache = render_cache
+        self.render_wait_timeout = max(0.0, min(5.0, float(render_wait_timeout)))
         self.image_signature_use_group = image_signature_use_group
         self.blacklist = blacklist
+        self._render_semaphore = asyncio.Semaphore(1)
+        self._render_tasks: set[asyncio.Task[bool]] = set()
+        self._render_inflight: dict[str, asyncio.Task[bool]] = {}
 
     async def add_quote(self, event: Any, uid: str = "") -> CommandResponse:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -137,11 +158,17 @@ class QuoteService:
             created_by=str(event.get_sender_id()),
             created_at=time(),
             group=session_key,
+            content_fingerprint=duplicate_fingerprint,
         )
         result = await self.repository.create_quote_with_segments(session_key, quote, all_segments)
         if result.duplicate:
-            logger.info(f"上传语录被拒绝: 图片重复, session={session_key}, target_qq={target_qq}")
+            logger.info(
+                f"上传语录被拒绝: {result.message or '内容重复'}, "
+                f"session={session_key}, target_qq={target_qq}"
+            )
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
+
+        self.schedule_pre_render(event, quote)
 
         image_count = len([segment for segment in all_segments if segment.type == "image"])
         logger.info(
@@ -211,10 +238,14 @@ class QuoteService:
             created_at=time(),
             group=session_key,
             kind="forward",
+            content_fingerprint=duplicate_fingerprint,
         )
         result = await self.repository.create_quote_with_forward_nodes(session_key, quote, nodes)
         if result.duplicate:
-            logger.info(f"上传聊天记录语录被拒绝: 图片重复, session={session_key}, target_qq={target_qq}")
+            logger.info(
+                f"上传聊天记录语录被拒绝: {result.message or '内容重复'}, "
+                f"session={session_key}, target_qq={target_qq}"
+            )
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
         message_count = self._count_forward_messages(nodes)
@@ -277,13 +308,38 @@ class QuoteService:
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
             )
 
-        signature = await self.napcat_service.resolve_signature_name(
-            event,
-            quote,
-            use_group_signature=self.image_signature_use_group,
-        )
-        rendered_url = await self.renderer.render_quote_image(quote, signature)
-        cached = await self.cache_rendered_result(rendered_url, cache_path)
+        if not self.render_cache:
+            signature = await self.napcat_service.resolve_signature_name(
+                event,
+                quote,
+                use_group_signature=self.image_signature_use_group,
+            )
+            rendered_url = await self.renderer.render_quote_image(quote, signature)
+            return CommandResponse(
+                kind="image_url",
+                url=rendered_url,
+                quote_id=quote.id,
+                delete_fingerprint=await self._fingerprint_image_url(rendered_url),
+            )
+
+        render_task = self._get_or_create_render_task(event, quote)
+        try:
+            cached = await asyncio.wait_for(
+                asyncio.shield(render_task),
+                timeout=self.render_wait_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                f"语录冷渲染超过等待预算，回退纯文本: quote_id={quote.id}, "
+                f"timeout={self.render_wait_timeout}s"
+            )
+            text = self._quote_plain_fallback(quote)
+            return CommandResponse(
+                kind="plain",
+                text=text,
+                quote_id=quote.id,
+                delete_fingerprint=self._fingerprint_plain_text(text),
+            )
         if cached:
             return CommandResponse(
                 kind="image_path",
@@ -291,15 +347,85 @@ class QuoteService:
                 quote_id=quote.id,
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
             )
+        text = self._quote_plain_fallback(quote)
         return CommandResponse(
-            kind="image_url",
-            url=rendered_url,
+            kind="plain",
+            text=text,
             quote_id=quote.id,
-            delete_fingerprint=await self._fingerprint_image_url(rendered_url),
+            delete_fingerprint=self._fingerprint_plain_text(text),
         )
 
     async def delete_quote(self, quote_id: str) -> bool:
+        task = self._render_inflight.get(quote_id)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         return await self.repository.delete_quote(quote_id)
+
+    def schedule_pre_render(self, event: Any, quote: Quote) -> None:
+        if not self._should_render_quote(quote):
+            return
+        self._get_or_create_render_task(event, quote)
+
+    def _should_render_quote(self, quote: Quote) -> bool:
+        if self.text_mode or not self.render_cache or quote.kind != "standard":
+            return False
+        if self.renderer.should_fallback_to_plain(quote):
+            return False
+        return not any(
+            segment.type == "image" and segment.asset_id
+            for segment in quote.segments
+        )
+
+    def _get_or_create_render_task(self, event: Any, quote: Quote) -> asyncio.Task[bool]:
+        existing = self._render_inflight.get(quote.id)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._render_quote_to_cache(event, quote),
+            name=f"quotes-pre-render-{quote.id}",
+        )
+        self._render_inflight[quote.id] = task
+        self._render_tasks.add(task)
+        task.add_done_callback(lambda done, quote_id=quote.id: self._finish_render_task(quote_id, done))
+        return task
+
+    def _finish_render_task(self, quote_id: str, task: asyncio.Task[bool]) -> None:
+        self._render_tasks.discard(task)
+        if self._render_inflight.get(quote_id) is task:
+            self._render_inflight.pop(quote_id, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning(f"语录后台预渲染失败: quote_id={quote_id}, error={exc}")
+
+    async def _render_quote_to_cache(self, event: Any, quote: Quote) -> bool:
+        store = self.repository.get_store(quote.group)
+        cache_path = store.cache_path(quote.id)
+        if cache_path.exists():
+            return True
+        async with self._render_semaphore:
+            if cache_path.exists():
+                return True
+            signature = await self.napcat_service.resolve_signature_name(
+                event,
+                quote,
+                use_group_signature=self.image_signature_use_group,
+            )
+            rendered_url = await self.renderer.render_quote_image(quote, signature)
+            cached = await self.cache_rendered_result(rendered_url, cache_path)
+            if cached:
+                logger.info(f"语录后台预渲染完成: quote_id={quote.id}, cache={cache_path}")
+            return cached
+
+    async def shutdown(self) -> None:
+        tasks = [task for task in self._render_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def resolve_delete_target(self, event: Any) -> str | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -382,6 +508,7 @@ class QuoteService:
         if not has_image:
             return []
 
+        asset_map = self.repository.find_assets(quote.group, quote.image_ids)
         chain: list[Any] = []
         for segment in quote.segments:
             if segment.type == "text":
@@ -391,7 +518,7 @@ class QuoteService:
                 continue
             if segment.type != "image" or not segment.asset_id:
                 continue
-            asset = self.repository.find_asset(quote.group, segment.asset_id)
+            asset = asset_map.get(segment.asset_id)
             if asset is None:
                 continue
             abs_path = self.repository.root / asset.rel_path
@@ -402,14 +529,31 @@ class QuoteService:
     def build_forward_quote_chain(self, quote: Quote) -> list[Any]:
         if not quote.forward_nodes:
             return []
-        nodes = [self._build_forward_node_component(quote.group, node) for node in quote.forward_nodes]
+        image_ids, media_ids = collect_forward_asset_ids(quote.forward_nodes)
+        image_map = self.repository.find_assets(quote.group, image_ids)
+        media_map = self.repository.find_media_assets(quote.group, media_ids)
+        nodes = [
+            self._build_forward_node_component(quote.group, node, image_map, media_map)
+            for node in quote.forward_nodes
+        ]
         nodes = [node for node in nodes if node is not None]
         if not nodes:
             return []
         return [Comp.Nodes(nodes=nodes)]
 
-    def _build_forward_node_component(self, session_key: str, node: ForwardNode) -> Any | None:
-        content = self._build_forward_segment_components(session_key, node.segments)
+    def _build_forward_node_component(
+        self,
+        session_key: str,
+        node: ForwardNode,
+        image_map: dict[str, Any],
+        media_map: dict[str, Any],
+    ) -> Any | None:
+        content = self._build_forward_segment_components(
+            session_key,
+            node.segments,
+            image_map,
+            media_map,
+        )
         if not content:
             content = [Comp.Plain("[空消息]")]
         try:
@@ -422,7 +566,13 @@ class QuoteService:
             logger.info(f"构造 forward 节点失败: {exc}")
             return None
 
-    def _build_forward_segment_components(self, session_key: str, segments: list[ForwardSegment]) -> list[Any]:
+    def _build_forward_segment_components(
+        self,
+        session_key: str,
+        segments: list[ForwardSegment],
+        image_map: dict[str, Any],
+        media_map: dict[str, Any],
+    ) -> list[Any]:
         content: list[Any] = []
         for segment in segments:
             if segment.type == "text":
@@ -432,7 +582,7 @@ class QuoteService:
                 continue
 
             if segment.type == "image" and segment.asset_id:
-                asset = self.repository.find_asset(session_key, segment.asset_id)
+                asset = image_map.get(segment.asset_id)
                 if asset is not None:
                     abs_path = self.repository.root / asset.rel_path
                     if abs_path.exists():
@@ -442,7 +592,7 @@ class QuoteService:
                 continue
 
             if segment.type in {"record", "video", "file"} and segment.asset_id:
-                media_asset = self.repository.find_media_asset(session_key, segment.asset_id)
+                media_asset = media_map.get(segment.asset_id)
                 if media_asset is None:
                     content.append(Comp.Plain(self._placeholder_for_media(segment.type)))
                     continue
@@ -472,7 +622,10 @@ class QuoteService:
                 continue
 
             if segment.type == "nodes":
-                nested_nodes = [self._build_forward_node_component(session_key, node) for node in segment.nodes]
+                nested_nodes = [
+                    self._build_forward_node_component(session_key, node, image_map, media_map)
+                    for node in segment.nodes
+                ]
                 nested_nodes = [node for node in nested_nodes if node is not None]
                 if nested_nodes:
                     content.append(Comp.Nodes(nodes=nested_nodes))
@@ -501,22 +654,42 @@ class QuoteService:
         if not self.render_cache:
             return False
         try:
+            content: bytes | None = None
             if rendered_url.startswith("file://"):
                 from urllib.parse import unquote, urlparse
+                from urllib.request import url2pathname
 
                 parsed = urlparse(rendered_url)
-                local_path = Path(unquote(parsed.path))
+                raw_path = url2pathname(unquote(parsed.path))
+                if parsed.netloc:
+                    raw_path = f"//{parsed.netloc}{raw_path}"
+                if len(raw_path) >= 3 and raw_path[0] in {"/", "\\"} and raw_path[2] == ":":
+                    raw_path = raw_path[1:]
+                local_path = Path(raw_path)
                 if local_path.exists():
-                    cache_path.write_bytes(local_path.read_bytes())
-                    return True
+                    content = await asyncio.to_thread(local_path.read_bytes)
+            elif rendered_url.startswith("data:image/") and ";base64," in rendered_url:
+                content = base64.b64decode(rendered_url.split(",", 1)[1], validate=True)
             elif rendered_url.startswith("http") and self.http_client is not None:
                 response = await self.http_client.get(rendered_url)
                 if getattr(response, "status_code", 200) < 400:
-                    cache_path.write_bytes(bytes(response.content))
-                    return True
+                    content = bytes(response.content)
+            else:
+                local_path = Path(str(rendered_url or ""))
+                if local_path.exists():
+                    content = await asyncio.to_thread(local_path.read_bytes)
+            if content:
+                await asyncio.to_thread(self._atomic_write_cache, cache_path, content)
+                return True
         except Exception as exc:
             logger.info(f"渲染缓存落盘失败: {exc}")
         return False
+
+    def _atomic_write_cache(self, cache_path: Path, content: bytes) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp_path.write_bytes(content)
+        tmp_path.replace(cache_path)
 
     def extract_at_qq(self, event: Any) -> str | None:
         try:
@@ -699,7 +872,8 @@ class QuoteService:
     async def _fingerprint_image_path(self, path: Path) -> str:
         try:
             if path.exists():
-                return self._fingerprint_image_sha(sha256_bytes(path.read_bytes()))
+                content = await asyncio.to_thread(path.read_bytes)
+                return self._fingerprint_image_sha(sha256_bytes(content))
         except Exception as exc:
             logger.info(f"计算语录图片指纹失败: {exc}")
         return ""
@@ -804,7 +978,8 @@ class QuoteService:
                 value = value[7:]
             path = Path(value)
             if path.exists():
-                return sha256_bytes(path.read_bytes())
+                content = await asyncio.to_thread(path.read_bytes)
+                return sha256_bytes(content)
             if value.startswith("http") and self.http_client is not None:
                 response = await self.http_client.get(value)
                 if getattr(response, "status_code", 200) < 400:
@@ -947,10 +1122,26 @@ class QuoteService:
     def _has_duplicate_quote(self, session_key: str, *, target_qq: str, fingerprint: str) -> bool:
         if not target_qq or not fingerprint:
             return False
-        for quote in self.repository.list_quotes(session_key):
+        has_fingerprint = getattr(self.repository, "has_content_fingerprint", None)
+        if callable(has_fingerprint) and has_fingerprint(session_key, target_qq, fingerprint):
+            return True
+        list_for_owner = getattr(self.repository, "list_quotes_for_owner", None)
+        quotes = (
+            list_for_owner(session_key, target_qq)
+            if callable(list_for_owner)
+            else self.repository.list_quotes(session_key)
+        )
+        update_fingerprint = getattr(self.repository, "update_content_fingerprint", None)
+        for quote in quotes:
             if str(quote.qq or "") != str(target_qq):
                 continue
+            if quote.content_fingerprint:
+                if quote.content_fingerprint == fingerprint:
+                    return True
+                continue
             existing_fingerprint = self._stored_quote_fingerprint(quote)
+            if existing_fingerprint and callable(update_fingerprint):
+                update_fingerprint(quote.id, existing_fingerprint)
             if existing_fingerprint and existing_fingerprint == fingerprint:
                 return True
         return False
