@@ -31,6 +31,7 @@ try:
     from .utils import (
         is_valid_qq,
         make_session_key,
+        normalize_image_file_for_send,
         normalize_quote_text,
         random_id,
         sha256_bytes,
@@ -51,6 +52,7 @@ except ImportError:  # pragma: no cover
     from utils import (
         is_valid_qq,
         make_session_key,
+        normalize_image_file_for_send,
         normalize_quote_text,
         random_id,
         sha256_bytes,
@@ -322,7 +324,7 @@ class QuoteService:
                 effective_signature = binding.tag
 
         logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
-        chain = self.build_quote_chain(quote, effective_signature)
+        chain = await self.build_quote_chain(quote, effective_signature)
         if chain:
             return CommandResponse(
                 kind="chain",
@@ -771,14 +773,14 @@ class QuoteService:
         logger.info(f"删除语录定位失败: 指纹未匹配 sent_index, session={session_key}")
         return None
 
-    def build_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
+    async def build_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
         if Comp is None:
             return []
         if quote.kind == "forward":
             return self.build_forward_quote_chain(quote)
-        return self.build_standard_quote_chain(quote, sender_id)
+        return await self.build_standard_quote_chain(quote, sender_id)
 
-    def build_standard_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
+    async def build_standard_quote_chain(self, quote: Quote, sender_id: str = "") -> list[Any]:
         if not quote.segments:
             return []
         has_image = any(segment.type == "image" and segment.asset_id for segment in quote.segments)
@@ -800,7 +802,18 @@ class QuoteService:
                 continue
             abs_path = self.repository.root / asset.rel_path
             if abs_path.exists():
-                chain.append(Comp.Image.fromFileSystem(str(abs_path)))
+                try:
+                    image_bytes = await asyncio.to_thread(
+                        normalize_image_file_for_send,
+                        abs_path,
+                    )
+                    chain.append(Comp.Image.fromBytes(image_bytes))
+                except Exception as exc:
+                    logger.warning(
+                        f"语录图片规范化失败，改发占位文本: "
+                        f"quote_id={quote.id}, path={abs_path}, error={exc}"
+                    )
+                    chain.append(Comp.Plain("[图片暂时无法发送]"))
         if chain:
             identifier = str(sender_id or quote.qq or quote.name).strip()
             if identifier:
@@ -1151,6 +1164,11 @@ class QuoteService:
         if len(normalized) == 1 and normalized[0].type == "image" and normalized[0].image is not None:
             return self._fingerprint_image_sha(normalized[0].image.sha256), normalized[0].image
 
+        reply_images = [
+            segment.image
+            for segment in normalized
+            if segment.type == "image" and segment.image is not None
+        ]
         return (
             self._hash_payload(
                 {
@@ -1161,7 +1179,7 @@ class QuoteService:
                     ],
                 }
             ),
-            None,
+            reply_images[0] if len(reply_images) == 1 else None,
         )
 
     def _is_avatar_text_quote(self, segments: list[Any]) -> bool:
@@ -1310,6 +1328,12 @@ class QuoteService:
         if not value:
             return ""
         try:
+            if value.startswith("base64://"):
+                content = base64.b64decode(value[9:], validate=True)
+                return sha256_bytes(content) if content else ""
+            if value.startswith("data:image/") and ";base64," in value:
+                content = base64.b64decode(value.split(",", 1)[1], validate=True)
+                return sha256_bytes(content) if content else ""
             if value.startswith("file:///"):
                 value = value[8:]
             elif value.startswith("file://"):
@@ -1338,11 +1362,16 @@ class QuoteService:
         )
 
     def _single_standard_image_signature(self, quote: Quote) -> ImageSignature | None:
-        if quote.kind != "standard" or len(quote.segments) != 1:
+        if quote.kind != "standard":
             return None
-        segment = quote.segments[0]
-        if segment.type != "image" or not segment.asset_id:
+        image_segments = [
+            segment
+            for segment in quote.segments
+            if segment.type == "image" and segment.asset_id
+        ]
+        if len(image_segments) != 1:
             return None
+        segment = image_segments[0]
         asset = self.repository.find_asset(quote.group, segment.asset_id)
         if asset is None or not asset.sha256:
             return None

@@ -596,13 +596,20 @@ class QuoteRepository:
                                 break
                         continue
 
-                    file_name = self._copy_legacy_image(session_key, normalized)
-                    if not file_name:
+                    try:
+                        prepared = prepare_image(
+                            normalized.read_bytes(),
+                            source=normalized.name,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"旧版图片压缩入池失败: path={normalized}, error={exc}")
                         continue
+                    asset_id = random_id("img_")
+                    file_name = f"{asset_id}.jpg"
                     copied_path = self.get_store(session_key).image_abs_path(file_name)
-                    prepared = prepare_image(copied_path.read_bytes(), source=file_name)
+                    copied_path.write_bytes(prepared.content)
                     asset = ImageAsset(
-                        asset_id=random_id("img_"),
+                        asset_id=asset_id,
                         file_name=file_name,
                         rel_path=rel_image_path(session_key, file_name),
                         sha256=prepared.sha256,
@@ -767,12 +774,13 @@ class QuoteRepository:
         created_at: float,
         created_files: list[Path],
     ) -> ImageAsset:
-        file_name = f"{random_id()}{image.extension}"
+        asset_id = random_id("img_")
+        file_name = f"{asset_id}.jpg"
         abs_path = store.image_abs_path(file_name)
         abs_path.write_bytes(image.content)
         created_files.append(abs_path)
         return ImageAsset(
-            asset_id=random_id("img_"),
+            asset_id=asset_id,
             file_name=file_name,
             rel_path=rel_image_path(store.session_key, file_name),
             sha256=image.sha256,

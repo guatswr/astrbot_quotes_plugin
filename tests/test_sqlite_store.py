@@ -4,7 +4,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+
+from PIL import Image as PillowImage
 
 from constants import DATABASE_FILENAME, DATABASE_SCHEMA_VERSION
 from models import (
@@ -12,11 +15,11 @@ from models import (
     PendingForwardNode,
     PendingForwardSegment,
     PendingQuoteSegment,
-    PreparedImage,
     PreparedMedia,
     Quote,
 )
 from sqlite_store import QuoteRepository
+from utils import prepare_image
 
 
 class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
@@ -200,14 +203,12 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_and_forward_media_lifecycle(self) -> None:
         repository = QuoteRepository(self.root)
-        prepared_image = PreparedImage(
-            content=b"image-content",
-            extension=".png",
-            sha256="image-sha",
-            dhash="0000000000000000",
-            width=100,
-            height=100,
+        source = BytesIO()
+        PillowImage.new("RGBA", (100, 80), (10, 20, 30, 128)).save(
+            source,
+            format="PNG",
         )
+        prepared_image = prepare_image(source.getvalue(), source="upload.png")
         image_quote = Quote(
             id="q_image",
             qq="10001",
@@ -228,6 +229,8 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(image_asset)
         image_path = self.root / image_asset.rel_path
         self.assertTrue(image_path.exists())
+        self.assertEqual(image_asset.file_name, f"{image_asset.asset_id}.jpg")
+        self.assertEqual(image_path.read_bytes(), prepared_image.content)
 
         duplicate_result = await repository.create_quote_with_segments(
             "123456",

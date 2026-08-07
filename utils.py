@@ -4,10 +4,11 @@ import hashlib
 import json
 import re
 import secrets
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     from astrbot.api import logger
@@ -27,6 +28,9 @@ try:
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
+        IMAGE_POOL_JPEG_QUALITY,
+        IMAGE_POOL_MAX_BYTES,
+        IMAGE_POOL_MAX_EDGE,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
     )
@@ -37,6 +41,9 @@ except ImportError:  # pragma: no cover
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
+        IMAGE_POOL_JPEG_QUALITY,
+        IMAGE_POOL_MAX_BYTES,
+        IMAGE_POOL_MAX_EDGE,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
     )
@@ -201,7 +208,10 @@ def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[
             if getattr(img, "is_animated", False):
                 img.seek(0)
             gray = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
-            pixels = list(gray.getdata())
+            if hasattr(gray, "get_flattened_data"):
+                pixels = list(gray.get_flattened_data())
+            else:  # Pillow < 14
+                pixels = list(gray.getdata())
     except Exception:
         return "", 0, 0
 
@@ -218,16 +228,95 @@ def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[
 
 
 def prepare_image(content: bytes, *, source: str = "", content_type: str = "") -> PreparedImage:
-    extension = guess_extension(source_name=source, content_type=content_type)
-    dhash, width, height = compute_dhash(content)
+    normalized = compress_image_for_pool(content)
+    dhash, width, height = compute_dhash(normalized)
     return PreparedImage(
-        content=content,
-        extension=extension,
-        sha256=sha256_bytes(content),
+        content=normalized,
+        extension=".jpg",
+        sha256=sha256_bytes(normalized),
         source=source,
         dhash=dhash,
         width=width,
         height=height,
+    )
+
+
+def compress_image_for_pool(
+    content: bytes,
+    *,
+    max_edge: int = IMAGE_POOL_MAX_EDGE,
+    max_bytes: int = IMAGE_POOL_MAX_BYTES,
+    initial_quality: int = IMAGE_POOL_JPEG_QUALITY,
+) -> bytes:
+    """Decode and compress an image into the canonical pool JPEG format."""
+    if not content:
+        raise ValueError("图片内容为空")
+
+    with Image.open(BytesIO(content)) as source:
+        if getattr(source, "is_animated", False):
+            source.seek(0)
+        source.load()
+        frame = ImageOps.exif_transpose(source)
+        frame.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+
+        if frame.mode in {"RGBA", "LA"} or (
+            frame.mode == "P" and "transparency" in frame.info
+        ):
+            rgba = frame.convert("RGBA")
+            rgb = Image.new("RGB", rgba.size, "white")
+            rgb.paste(rgba, mask=rgba.getchannel("A"))
+        else:
+            rgb = frame.convert("RGB")
+
+        quality = max(68, min(95, int(initial_quality)))
+        for _ in range(8):
+            output = BytesIO()
+            rgb.save(output, format="JPEG", quality=quality, optimize=True)
+            normalized = output.getvalue()
+            if len(normalized) <= max_bytes:
+                return normalized
+
+            width, height = rgb.size
+            if width <= 640 and height <= 640:
+                break
+            rgb = rgb.resize(
+                (max(1, int(width * 0.82)), max(1, int(height * 0.82))),
+                Image.Resampling.LANCZOS,
+            )
+            quality = max(68, quality - 4)
+
+    raise ValueError(f"图片规范化后仍超过 {max_bytes} 字节")
+
+
+def normalize_image_file_for_send(
+    path: Path,
+    *,
+    max_edge: int = IMAGE_POOL_MAX_EDGE,
+    max_bytes: int = IMAGE_POOL_MAX_BYTES,
+) -> bytes:
+    """Load a pool image, reusing canonical JPEG bytes or upgrading legacy data."""
+    content = Path(path).read_bytes()
+    if not content:
+        raise ValueError("图片文件为空")
+
+    try:
+        with Image.open(BytesIO(content)) as source:
+            is_canonical = (
+                source.format == "JPEG"
+                and not getattr(source, "is_animated", False)
+                and max(source.size) <= max_edge
+                and len(content) <= max_bytes
+            )
+            source.verify()
+        if is_canonical:
+            return content
+    except Exception:
+        pass
+
+    return compress_image_for_pool(
+        content,
+        max_edge=max_edge,
+        max_bytes=max_bytes,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,6 +48,10 @@ class FakeImage:
     @staticmethod
     def fromFileSystem(path: str) -> "FakeImage":
         return FakeImage(str(Path(path).resolve()))
+
+    @staticmethod
+    def fromBytes(content: bytes) -> "FakeImage":
+        return FakeImage(f"base64://{base64.b64encode(content).decode()}")
 
 
 class FakeImageService:
@@ -160,7 +165,9 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             image_path = root / "quote.png"
-            image_path.write_bytes(b"fake-png")
+            from PIL import Image as PillowImage
+
+            PillowImage.new("RGBA", (32, 24), (255, 0, 0, 128)).save(image_path)
             service = object.__new__(QuoteService)
             service.repository = SimpleNamespace(
                 root=root,
@@ -180,19 +187,28 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
                 segments=[QuoteSegment(type="image", asset_id="asset-1")],
             )
             try:
-                chain = service.build_standard_quote_chain(quote, "名言")
+                chain = await service.build_standard_quote_chain(quote, "名言")
                 service.http_client = None
 
                 self.assertEqual(len(chain), 2)
                 self.assertIsInstance(chain[0], FakeImage)
+                self.assertTrue(chain[0].file.startswith("base64://"))
+                self.assertFalse(chain[0].file.startswith("file://"))
+                self.assertTrue(base64.b64decode(chain[0].file[9:]).startswith(b"\xff\xd8"))
                 self.assertEqual(chain[1].text, "\n— 名言")
                 self.assertEqual(
                     await service.build_delete_fingerprint(quote, chain=chain),
                     await service._fingerprint_standard_chain(chain),
                 )
 
-                unbound_chain = service.build_standard_quote_chain(quote)
+                unbound_chain = await service.build_standard_quote_chain(quote)
                 self.assertEqual(unbound_chain[-1].text, "\n— 10001")
+
+                image_path.write_bytes(b"not-an-image")
+                invalid_chain = await service.build_standard_quote_chain(quote, "名言")
+                self.assertFalse(any(isinstance(item, FakeImage) for item in invalid_chain))
+                self.assertEqual(invalid_chain[0].text, "[图片暂时无法发送]")
+                self.assertEqual(invalid_chain[-1].text, "\n— 名言")
             finally:
                 quote_service_module.Comp = original_components
 
