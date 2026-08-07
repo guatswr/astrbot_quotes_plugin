@@ -197,6 +197,27 @@ class SessionStore:
             )
         ]
 
+    def clear_cache_files(self) -> tuple[int, int]:
+        removed = 0
+        failed = 0
+        if not self.cache_dir.exists():
+            return removed, failed
+        try:
+            paths = list(self.cache_dir.iterdir())
+        except OSError as exc:
+            logger.info(f"读取语录缓存目录失败: path={self.cache_dir}, error={exc}")
+            return removed, 1
+        for path in paths:
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                failed += 1
+                logger.info(f"删除语录缓存文件失败: path={path}, error={exc}")
+        return removed, failed
+
     def load_sent_records(self) -> list[SentQuoteRecord]:
         payload = read_json(
             self.sent_index_file,

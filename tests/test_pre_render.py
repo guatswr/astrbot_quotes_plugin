@@ -287,6 +287,58 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(default_cache.exists())
             await service.shutdown()
 
+    async def test_clear_render_cache_is_session_scoped_and_cancels_rendering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "render-source.png"
+            source.write_bytes(b"fake-png")
+            repository = QuoteRepository(root)
+            quote = Quote(
+                id="q_clear_cache",
+                qq="10001",
+                name="测试用户",
+                text="缓存清理测试",
+                created_by="20002",
+                created_at=10.0,
+                group="123456",
+                content_fingerprint="clear-cache-fingerprint",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text="缓存清理测试")],
+            )
+            current_store = repository.get_store("123456")
+            current_store.cache_path(quote.id).write_bytes(b"cached")
+            (current_store.cache_dir / "orphan.png.tmp").write_bytes(b"temporary")
+            other_store = repository.get_store("654321")
+            other_cache = other_store.cache_path("q_other")
+            other_cache.write_bytes(b"keep")
+
+            renderer = BlockingRenderer(source)
+            service = QuoteService(
+                repository=repository,
+                image_service=FakeImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=renderer,
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+            service.schedule_pre_render(FakeEvent(), quote, signature_override="inflight")
+            await asyncio.wait_for(renderer.started.wait(), timeout=1.0)
+
+            removed, failed = await service.clear_render_cache("123456")
+
+            self.assertEqual((removed, failed), (2, 0))
+            self.assertEqual(list(current_store.cache_dir.iterdir()), [])
+            self.assertTrue(other_cache.exists())
+            self.assertFalse(service._render_tasks)
+            await service.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

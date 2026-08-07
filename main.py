@@ -99,6 +99,21 @@ class QuotesPlugin(Star):
         for item in self._emit_response(event, response):
             yield item
 
+    @filter.command("语录缓存清理")
+    async def clear_quote_cache(self, event: AstrMessageEvent):
+        removed, failed = await self.quote_service.clear_render_cache(self._session_key(event))
+        if failed:
+            yield event.plain_result(
+                f"语录缓存清理完成：已删除 {removed} 个文件，{failed} 个文件清理失败。"
+            )
+        elif removed:
+            yield event.plain_result(
+                f"已清理当前会话的语录缓存，共删除 {removed} 个文件；需要时会自动重新渲染。\n"
+                "缓存打扫完毕！高性能ですから！"
+            )
+        else:
+            yield event.plain_result("当前会话没有可清理的语录缓存。")
+
     @filter.command("删除", alias={"删除语录"})
     async def delete_quote(self, event: AstrMessageEvent):
         if not await self._check_delete_permission(event):
@@ -128,6 +143,7 @@ class QuotesPlugin(Star):
             "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
             "- 绑定 @某人 tag：发送纯文本 tag 时随机该用户的语录。\n"
             "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
+            "- 语录缓存清理：清理当前会话的语录渲染缓存。\n"
             "- 语录帮助：查看本帮助。"
         )
         yield event.plain_result(help_text)

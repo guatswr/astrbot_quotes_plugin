@@ -535,6 +535,21 @@ class QuoteService:
 
         await asyncio.to_thread(remove_paths)
 
+    async def clear_render_cache(self, session_key: str) -> tuple[int, int]:
+        quote_ids = {quote.id for quote in self.repository.list_quotes(session_key)}
+        tasks = [
+            task
+            for (quote_id, _), task in self._render_inflight.items()
+            if quote_id in quote_ids and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        store = self.repository.get_store(session_key)
+        return await asyncio.to_thread(store.clear_cache_files)
+
     async def shutdown(self) -> None:
         tasks = [task for task in self._render_tasks if not task.done()]
         for task in tasks:
