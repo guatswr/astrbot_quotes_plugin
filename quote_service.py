@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
     Comp = None  # type: ignore
 
 try:
-    from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
+    from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE, UPLOAD_SUCCESS_PROMPT
     from .models import (
         CommandResponse,
         ForwardNode,
@@ -36,7 +36,7 @@ try:
         sha256_bytes,
     )
 except ImportError:  # pragma: no cover
-    from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
+    from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE, UPLOAD_SUCCESS_PROMPT
     from models import (
         CommandResponse,
         ForwardNode,
@@ -187,8 +187,16 @@ class QuoteService:
             f"segments={len(all_segments)}, images={image_count}"
         )
         if image_count:
-            return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。")
-        return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{quote.text}")
+            return CommandResponse(
+                kind="plain",
+                text=self._upload_success_text(
+                    f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。"
+                ),
+            )
+        return CommandResponse(
+            kind="plain",
+            text=self._upload_success_text(f"已收录 {quote.name} 的语录：{quote.text}"),
+        )
 
     async def _add_forward_quote(
         self,
@@ -265,7 +273,9 @@ class QuoteService:
         )
         return CommandResponse(
             kind="plain",
-            text=f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。",
+            text=self._upload_success_text(
+                f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。"
+            ),
         )
 
     async def random_quote(
@@ -289,9 +299,17 @@ class QuoteService:
             if silent_if_empty:
                 return None
             if only_qq:
-                text = "这个用户还没有语录哦~" if self.global_mode else "这个用户在本会话还没有语录哦~"
+                text = (
+                    "我的记忆库里还没有这位的语录。再教我一点吧！"
+                    if self.global_mode
+                    else "这个会话的记忆库里还没有这位的语录。再教我一点吧！"
+                )
             else:
-                text = "还没有语录，先用 上传 保存一条吧~" if self.global_mode else "本会话还没有语录，先用 上传 保存一条吧~"
+                text = (
+                    "我的记忆库还是空的，先用 /上传 教教我吧！"
+                    if self.global_mode
+                    else "这个会话的记忆库还是空的，先用 /上传 教教我吧！"
+                )
             return CommandResponse(kind="plain", text=text)
 
         logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
@@ -372,6 +390,9 @@ class QuoteService:
             quote_id=quote.id,
             delete_fingerprint=self._fingerprint_plain_text(text),
         )
+
+    def _upload_success_text(self, detail: str) -> str:
+        return f"{detail}\n{UPLOAD_SUCCESS_PROMPT}"
 
     async def delete_quote(self, quote_id: str) -> bool:
         tasks = [

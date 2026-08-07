@@ -129,6 +129,7 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
 
             response = await service.add_quote(FakeEvent())
             self.assertEqual(response.kind, "plain")
+            self.assertIn("我学会啦，来问问我吧！", response.text)
             self.assertTrue(service._render_tasks)
             await asyncio.wait_for(renderer.started.wait(), timeout=1.0)
             self.assertTrue(any(not task.done() for task in service._render_tasks))
@@ -146,6 +147,42 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             warm_response = await service.random_quote(FakeEvent())
             self.assertEqual(warm_response.kind, "image_path")
             self.assertEqual(Path(warm_response.path), cache_path)
+            await service.shutdown()
+
+    async def test_missing_owner_quote_uses_memory_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = QuoteRepository(root)
+            service = QuoteService(
+                repository=repository,
+                image_service=FakeImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=CapturingRenderer(root / "unused.png"),
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+
+            response = await service.random_quote(
+                FakeEvent(),
+                uid="10001",
+                silent_if_empty=False,
+            )
+            self.assertEqual(response.kind, "plain")
+            self.assertEqual(
+                response.text,
+                "这个会话的记忆库里还没有这位的语录。再教我一点吧！",
+            )
+            self.assertIsNone(
+                await service.random_quote(
+                    FakeEvent(),
+                    uid="10001",
+                    silent_if_empty=True,
+                )
+            )
             await service.shutdown()
 
     async def test_upload_pre_renders_all_global_binding_signatures(self) -> None:

@@ -213,7 +213,7 @@ class QuotesPlugin(Star):
         response = await self.quote_service.random_quote(
             event,
             uid=binding.qq,
-            silent_if_empty=True,
+            silent_if_empty=False,
             signature_override=binding.tag,
         )
         for item in self._emit_response(event, response):
