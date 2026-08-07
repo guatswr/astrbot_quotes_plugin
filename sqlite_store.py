@@ -287,6 +287,13 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             ).fetchall()
         return [self._row_to_binding(row) for row in rows]
 
+    def list_all_bindings(self) -> list[QuoteBinding]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM quote_bindings ORDER BY session_key, qq, tag"
+            ).fetchall()
+        return [self._row_to_binding(row) for row in rows]
+
     async def create_binding(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
         if not session_key or not qq or not str(tag).strip():
             return "invalid", ""
@@ -446,6 +453,13 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             rows = connection.execute(
                 "SELECT * FROM quotes WHERE session_key = ? ORDER BY created_at, id",
                 (session_key,),
+            ).fetchall()
+        return [self._row_to_quote(row) for row in rows]
+
+    def list_all_quotes(self) -> list[Quote]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM quotes ORDER BY created_at DESC, id DESC"
             ).fetchall()
         return [self._row_to_quote(row) for row in rows]
 

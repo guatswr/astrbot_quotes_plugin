@@ -334,6 +334,105 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(default_cache.exists())
             await service.shutdown()
 
+    async def test_regular_random_quote_uses_bound_tag_for_cache_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "render-source.png"
+            source.write_bytes(b"fake-png")
+            repository = QuoteRepository(root)
+            await repository.create_binding("123456", "10001", "名言")
+            quote = Quote(
+                id="q_bound_random",
+                qq="10001",
+                name="原昵称",
+                text="绑定签名测试",
+                created_by="20002",
+                created_at=10.0,
+                group="123456",
+                content_fingerprint="bound-random-fingerprint",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+            renderer = BlockingRenderer(source)
+            service = QuoteService(
+                repository=repository,
+                image_service=FakeImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=renderer,
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+                render_wait_timeout=0.01,
+            )
+
+            response = await service.random_quote(FakeEvent())
+            self.assertEqual(response.kind, "plain")
+            self.assertEqual(response.text, "「绑定签名测试」 — 名言")
+            renderer.release.set()
+            await asyncio.gather(*list(service._render_tasks))
+            tag_cache = repository.get_store("123456").cache_path("q_bound_random", "名言")
+            self.assertTrue(tag_cache.exists())
+
+            cached_response = await service.random_quote(FakeEvent())
+            self.assertEqual(cached_response.kind, "image_path")
+            self.assertEqual(Path(cached_response.path), tag_cache)
+            await service.shutdown()
+
+    async def test_startup_pre_render_backfills_existing_default_and_tag_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "render-source.png"
+            source.write_bytes(b"fake-png")
+            repository = QuoteRepository(root)
+            await repository.create_binding("123456", "10001", "名言")
+            await repository.create_binding("654321", "10001", "其他群标签")
+            quote = Quote(
+                id="q_startup",
+                qq="10001",
+                name="原昵称",
+                text="启动预渲染测试",
+                created_by="20002",
+                created_at=10.0,
+                group="123456",
+                content_fingerprint="startup-render-fingerprint",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+            renderer = CapturingRenderer(source)
+            service = QuoteService(
+                repository=repository,
+                image_service=FakeImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=renderer,
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+
+            service.schedule_startup_pre_render()
+            startup_task = service._startup_pre_render_task
+            self.assertIsNotNone(startup_task)
+            await startup_task
+
+            store = repository.get_store("123456")
+            self.assertFalse(store.cache_path("q_startup").exists())
+            self.assertTrue(store.cache_path("q_startup", "名言").exists())
+            self.assertFalse(store.cache_path("q_startup", "其他群标签").exists())
+            self.assertEqual(renderer.signatures, ["名言"])
+            await service.shutdown()
+
     async def test_clear_render_cache_is_session_scoped_and_cancels_rendering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

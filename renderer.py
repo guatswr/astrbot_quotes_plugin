@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
 class QuoteRenderer:
     MAX_RENDER_TEXT_LENGTH = 260
     PLAIN_FALLBACK_TEXT_LENGTH = 1000
+    SHIKI_RUNTIME_MARKER = '<script id="astrbot-t2i-shiki-runtime"></script>'
 
     def __init__(
         self,
@@ -37,7 +38,10 @@ class QuoteRenderer:
         )
 
     async def warmup(self) -> None:
-        minimal = '<div style="width:320px;height:120px;background:#000;color:#fff">init</div>'
+        minimal = (
+            f"{self.SHIKI_RUNTIME_MARKER}"
+            '<div style="width:320px;height:120px;background:#000;color:#fff">init</div>'
+        )
         try:
             await self._render_template(
                 minimal,
@@ -121,6 +125,7 @@ class QuoteRenderer:
         <html>
         <head>
             <meta charset='utf-8' />
+            {self.SHIKI_RUNTIME_MARKER}
             <style>
                 * {{ box-sizing: border-box; }}
                 html, body {{ margin:0; padding:0; width:{width}px; height:{height}px; background:{bg_color}; }}

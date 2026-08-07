@@ -87,6 +87,8 @@ class QuoteService:
         self._render_semaphore = asyncio.Semaphore(1)
         self._render_tasks: set[asyncio.Task[bool]] = set()
         self._render_inflight: dict[tuple[str, str], asyncio.Task[bool]] = {}
+        self._startup_pre_render_task: asyncio.Task[None] | None = None
+        self._skip_startup_prewarm_sessions: set[str] = set()
 
     async def add_quote(self, event: Any, uid: str = "") -> CommandResponse:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -168,7 +170,6 @@ class QuoteService:
             )
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
-        self.schedule_pre_render(event, quote)
         bindings = []
         if target_qq:
             bindings = (
@@ -176,9 +177,11 @@ class QuoteService:
                 if self.global_mode
                 else [self.repository.get_binding_for_qq(session_key, target_qq)]
             )
+        bindings = [binding for binding in bindings if binding is not None]
         for binding in bindings:
-            if binding is not None:
-                self.schedule_pre_render(event, quote, signature_override=binding.tag)
+            self.schedule_pre_render(event, quote, signature_override=binding.tag)
+        if self.global_mode or not bindings:
+            self.schedule_pre_render(event, quote)
 
         image_count = len([segment for segment in all_segments if segment.type == "image"])
         logger.info(
@@ -312,6 +315,12 @@ class QuoteService:
                 )
             return CommandResponse(kind="plain", text=text)
 
+        effective_signature = signature_override
+        if not effective_signature and quote.qq:
+            binding = self.repository.get_binding_for_qq(session_key, quote.qq)
+            if binding is not None:
+                effective_signature = binding.tag
+
         logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
         chain = self.build_quote_chain(quote)
         if chain:
@@ -324,7 +333,7 @@ class QuoteService:
             )
 
         if self.text_mode or quote.kind == "forward" or self.renderer.should_fallback_to_plain(quote):
-            text = self._quote_plain_fallback(quote)
+            text = self._quote_plain_fallback(quote, effective_signature)
             return CommandResponse(
                 kind="plain",
                 text=text,
@@ -333,7 +342,7 @@ class QuoteService:
             )
 
         store = self.repository.get_store(quote.group)
-        cache_path = store.cache_path(quote.id, signature_override)
+        cache_path = store.cache_path(quote.id, effective_signature)
         if self.render_cache and cache_path.exists():
             return CommandResponse(
                 kind="image_path",
@@ -343,7 +352,7 @@ class QuoteService:
             )
 
         if not self.render_cache:
-            signature = signature_override or await self.napcat_service.resolve_signature_name(
+            signature = effective_signature or await self.napcat_service.resolve_signature_name(
                 event, quote, use_group_signature=self.image_signature_use_group
             )
             rendered_url = await self.renderer.render_quote_image(quote, signature)
@@ -357,7 +366,7 @@ class QuoteService:
         render_task = self._get_or_create_render_task(
             event,
             quote,
-            signature_override=signature_override,
+            signature_override=effective_signature,
         )
         try:
             cached = await asyncio.wait_for(
@@ -369,7 +378,7 @@ class QuoteService:
                 f"语录冷渲染超过等待预算，回退纯文本: quote_id={quote.id}, "
                 f"timeout={self.render_wait_timeout}s"
             )
-            text = self._quote_plain_fallback(quote)
+            text = self._quote_plain_fallback(quote, effective_signature)
             return CommandResponse(
                 kind="plain",
                 text=text,
@@ -383,7 +392,7 @@ class QuoteService:
                 quote_id=quote.id,
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
             )
-        text = self._quote_plain_fallback(quote)
+        text = self._quote_plain_fallback(quote, effective_signature)
         return CommandResponse(
             kind="plain",
             text=text,
@@ -412,6 +421,7 @@ class QuoteService:
         quote: Quote,
         *,
         signature_override: str = "",
+        resolved_signature: str = "",
     ) -> None:
         if not self._should_render_quote(quote):
             return
@@ -419,7 +429,86 @@ class QuoteService:
             event,
             quote,
             signature_override=signature_override,
+            resolved_signature=resolved_signature,
         )
+
+    def schedule_startup_pre_render(self) -> None:
+        if self.text_mode or not self.render_cache:
+            return
+        existing = self._startup_pre_render_task
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._pre_render_existing_quotes(),
+            name="quotes-startup-pre-render",
+        )
+        self._startup_pre_render_task = task
+        task.add_done_callback(self._finish_startup_pre_render)
+
+    def _finish_startup_pre_render(self, task: asyncio.Task[None]) -> None:
+        if self._startup_pre_render_task is task:
+            self._startup_pre_render_task = None
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning(f"启动期语录预渲染失败: {exc}")
+
+    async def _pre_render_existing_quotes(self) -> None:
+        quotes, bindings = await asyncio.gather(
+            asyncio.to_thread(self.repository.list_all_quotes),
+            asyncio.to_thread(self.repository.list_all_bindings),
+        )
+        tags_by_qq: dict[str, set[str]] = {}
+        tags_by_session_qq: dict[tuple[str, str], set[str]] = {}
+        for binding in bindings:
+            tags_by_qq.setdefault(binding.qq, set()).add(binding.tag)
+            tags_by_session_qq.setdefault((binding.session_key, binding.qq), set()).add(
+                binding.tag
+            )
+
+        generated = 0
+        for quote in quotes:
+            if quote.group in self._skip_startup_prewarm_sessions:
+                continue
+            if not self._should_render_quote(quote):
+                continue
+
+            tags = (
+                tags_by_qq.get(quote.qq, set())
+                if self.global_mode
+                else tags_by_session_qq.get((quote.group, quote.qq), set())
+            )
+            variants = [(tag, tag) for tag in sorted(tags)]
+            if not self.image_signature_use_group and (self.global_mode or not tags):
+                variants.append(("", quote.name))
+            for cache_variant, resolved_signature in variants:
+                if quote.group in self._skip_startup_prewarm_sessions:
+                    break
+                cache_path = self.repository.get_store(quote.group).cache_path(
+                    quote.id,
+                    cache_variant,
+                )
+                if cache_path.exists():
+                    continue
+                task = self._get_or_create_render_task(
+                    None,
+                    quote,
+                    signature_override=cache_variant,
+                    resolved_signature=resolved_signature,
+                )
+                try:
+                    cached = await task
+                except Exception as exc:
+                    logger.info(
+                        f"启动期单条语录预渲染失败: quote_id={quote.id}, error={exc}"
+                    )
+                    continue
+                if cached:
+                    generated += 1
+                await asyncio.sleep(0)
+        logger.info(f"启动期语录预渲染完成: generated={generated}")
 
     def schedule_binding_pre_render(
         self,
@@ -435,6 +524,20 @@ class QuoteService:
         )
         for quote in quotes:
             self.schedule_pre_render(event, quote, signature_override=tag)
+
+    def schedule_owner_default_pre_render(
+        self,
+        event: Any,
+        session_key: str,
+        qq: str,
+    ) -> None:
+        quotes = (
+            self.repository.list_quotes_for_owner_global(qq)
+            if self.global_mode
+            else self.repository.list_quotes_for_owner(session_key, qq)
+        )
+        for quote in quotes:
+            self.schedule_pre_render(event, quote)
 
     def _should_render_quote(self, quote: Quote) -> bool:
         if self.text_mode or not self.render_cache or quote.kind != "standard":
@@ -452,6 +555,7 @@ class QuoteService:
         quote: Quote,
         *,
         signature_override: str = "",
+        resolved_signature: str = "",
     ) -> asyncio.Task[bool]:
         task_key = (quote.id, signature_override)
         existing = self._render_inflight.get(task_key)
@@ -462,6 +566,7 @@ class QuoteService:
                 event,
                 quote,
                 signature_override=signature_override,
+                resolved_signature=resolved_signature,
             ),
             name=f"quotes-pre-render-{quote.id}",
         )
@@ -487,6 +592,7 @@ class QuoteService:
         quote: Quote,
         *,
         signature_override: str = "",
+        resolved_signature: str = "",
     ) -> bool:
         store = self.repository.get_store(quote.group)
         cache_path = store.cache_path(quote.id, signature_override)
@@ -495,9 +601,11 @@ class QuoteService:
         async with self._render_semaphore:
             if cache_path.exists():
                 return True
-            signature = signature_override or await self.napcat_service.resolve_signature_name(
-                event, quote, use_group_signature=self.image_signature_use_group
-            )
+            signature = resolved_signature or signature_override
+            if not signature:
+                signature = await self.napcat_service.resolve_signature_name(
+                    event, quote, use_group_signature=self.image_signature_use_group
+                )
             rendered_url = await self.renderer.render_quote_image(quote, signature)
             cached = await self.cache_rendered_result(rendered_url, cache_path)
             if cached:
@@ -536,6 +644,7 @@ class QuoteService:
         await asyncio.to_thread(remove_paths)
 
     async def clear_render_cache(self, session_key: str) -> tuple[int, int]:
+        self._skip_startup_prewarm_sessions.add(session_key)
         quote_ids = {quote.id for quote in self.repository.list_quotes(session_key)}
         tasks = [
             task
@@ -601,11 +710,17 @@ class QuoteService:
         return text or "[无文本内容]"
 
     async def shutdown(self) -> None:
+        startup_task = self._startup_pre_render_task
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
         tasks = [task for task in self._render_tasks if not task.done()]
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        pending: list[asyncio.Task[Any]] = list(tasks)
+        if startup_task is not None:
+            pending.append(startup_task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def resolve_delete_target(self, event: Any) -> str | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -964,10 +1079,10 @@ class QuoteService:
                     total += self._count_forward_messages(segment.nodes)
         return total
 
-    def _quote_plain_fallback(self, quote: Quote) -> str:
+    def _quote_plain_fallback(self, quote: Quote, signature: str = "") -> str:
         if quote.kind == "forward":
             return quote.text or f"{quote.name} 的聊天记录语录"
-        return f"「{quote.text}」 — {quote.name}"
+        return f"「{quote.text}」 — {signature or quote.name}"
 
     async def build_delete_fingerprint(self, quote: Quote, *, chain: list[Any] | None = None) -> str:
         if quote.kind == "forward":

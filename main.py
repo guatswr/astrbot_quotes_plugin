@@ -78,6 +78,7 @@ class QuotesPlugin(Star):
     async def initialize(self):
         await self.repository.migrate_legacy_data()
         await self.renderer.warmup()
+        self.quote_service.schedule_startup_pre_render()
 
     async def terminate(self):
         await self.quote_service.shutdown()
@@ -214,6 +215,7 @@ class QuotesPlugin(Star):
             yield event.plain_result(f'已重新绑定：“{resolved_tag}” → @{qq}')
         elif status == "removed":
             await self.quote_service.remove_signature_cache(session_key, qq, detail)
+            self.quote_service.schedule_owner_default_pre_render(event, session_key, qq)
             yield event.plain_result(f'已取消 @{qq} 的绑定“{detail}”。')
         elif status == "unchanged":
             yield event.plain_result(f'绑定未变化：@{qq} 仍绑定到“{detail}”。')
