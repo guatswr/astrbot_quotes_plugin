@@ -256,6 +256,111 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await repository.delete_quote("q_forward"))
         self.assertFalse(media_path.exists())
 
+    async def test_binding_lifecycle_and_session_uniqueness(self) -> None:
+        repository = QuoteRepository(self.root)
+
+        self.assertEqual(
+            await repository.create_binding("123456", "10001", "tag"),
+            ("created", "tag"),
+        )
+        self.assertEqual(
+            await repository.create_binding("123456", "10001", "tag"),
+            ("unchanged", "tag"),
+        )
+        self.assertEqual(
+            await repository.create_binding("123456", "10001", "tag2"),
+            ("qq_exists", "tag"),
+        )
+        self.assertEqual(
+            await repository.create_binding("123456", "10002", "tag"),
+            ("tag_exists", "10001"),
+        )
+        self.assertEqual(
+            await repository.create_binding("123456", "10002", "other"),
+            ("created", "other"),
+        )
+        self.assertEqual(
+            await repository.create_binding("654321", "10003", "tag"),
+            ("created", "tag"),
+        )
+
+        self.assertEqual(repository.get_binding_by_tag("123456", "tag").qq, "10001")
+        self.assertEqual(repository.get_binding_for_qq("123456", "10002").tag, "other")
+        self.assertEqual([item.tag for item in repository.list_bindings("123456")], ["other", "tag"])
+        self.assertEqual(
+            [item.session_key for item in repository.list_bindings_for_qq_global("10001")],
+            ["123456"],
+        )
+
+        self.assertEqual(
+            await repository.rebind("123456", "10001", "other"),
+            ("tag_exists", "10002"),
+        )
+        self.assertEqual(
+            await repository.rebind("123456", "10001", "tag2"),
+            ("updated", "tag"),
+        )
+        self.assertIsNone(repository.get_binding_by_tag("123456", "tag"))
+        self.assertEqual(repository.get_binding_by_tag("123456", "tag2").qq, "10001")
+        self.assertEqual(
+            await repository.rebind("123456", "10001"),
+            ("removed", "tag2"),
+        )
+        self.assertIsNone(repository.get_binding_for_qq("123456", "10001"))
+        self.assertEqual(
+            await repository.rebind("123456", "10001", "new"),
+            ("not_found", ""),
+        )
+
+    async def test_upgrades_sqlite_schema_v1_to_v2(self) -> None:
+        repository = QuoteRepository(self.root)
+        legacy_quote = Quote(
+            id="q_before_binding_schema",
+            qq="10001",
+            name="旧用户",
+            text="升级前数据",
+            created_by="20002",
+            created_at=100.0,
+            group="123456",
+            content_fingerprint="before-binding-schema",
+        )
+        await repository.create_quote_with_segments(
+            "123456",
+            legacy_quote,
+            [PendingQuoteSegment(type="text", text="升级前数据")],
+        )
+
+        database_path = self.root / DATABASE_FILENAME
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("DROP TABLE quote_bindings")
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+        finally:
+            connection.close()
+
+        repository = QuoteRepository(self.root)
+        self.assertEqual(
+            repository.get_quote("123456", "q_before_binding_schema").text,
+            "升级前数据",
+        )
+        self.assertEqual(
+            await repository.create_binding("123456", "10001", "tag"),
+            ("created", "tag"),
+        )
+        connection = sqlite3.connect(database_path)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DATABASE_SCHEMA_VERSION,
+            )
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quote_bindings'"
+            ).fetchone()
+            self.assertIsNotNone(table)
+        finally:
+            connection.close()
+
     async def test_migrates_root_legacy_json(self) -> None:
         (self.root / "quotes.json").write_text(
             json.dumps(

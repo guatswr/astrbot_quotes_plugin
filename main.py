@@ -21,7 +21,7 @@ try:
     from .quote_service import QuoteService
     from .renderer import QuoteRenderer
     from .sqlite_store import QuoteRepository
-    from .utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
+    from .utils import ensure_plugin_data_dir, is_valid_qq, make_session_key, resolve_wake_prefixes
 except ImportError:  # pragma: no cover
     from constants import PLUGIN_NAME
     from image_service import ImageService
@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover
     from quote_service import QuoteService
     from renderer import QuoteRenderer
     from sqlite_store import QuoteRepository
-    from utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
+    from utils import ensure_plugin_data_dir, is_valid_qq, make_session_key, resolve_wake_prefixes
 
 
 @register(
@@ -48,9 +48,10 @@ class QuotesPlugin(Star):
         self.data_root = ensure_plugin_data_dir(str(self.config.get("storage") or "").strip(), PLUGIN_NAME)
         self.repository = QuoteRepository(self.data_root)
         self.napcat_service = NapcatService()
+        self._wake_prefixes = resolve_wake_prefixes(self._resolve_context_config())
         self.image_service = ImageService(
             self.http_client,
-            wake_prefixes=resolve_wake_prefixes(self._resolve_context_config()),
+            wake_prefixes=self._wake_prefixes,
         )
         self.renderer = QuoteRenderer(self.html_render, self.config.get("image") or {})
         performance_config = self.config.get("performance") or {}
@@ -125,9 +126,98 @@ class QuotesPlugin(Star):
             "- 上传：回复消息后发送，保存为语录；可用“上传 @某人”或“上传 QQ号”指定归属。\n"
             "- 语录：随机发送语录；可用“语录 @某人”或“语录 QQ号”指定用户。\n"
             "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
+            "- 绑定 @某人 tag：发送纯文本 tag 时随机该用户的语录。\n"
+            "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
             "- 语录帮助：查看本帮助。"
         )
         yield event.plain_result(help_text)
+
+    @filter.command("绑定列表")
+    async def list_quote_bindings(self, event: AstrMessageEvent):
+        bindings = self.repository.list_bindings(self._session_key(event))
+        if not bindings:
+            yield event.plain_result("当前会话还没有语录绑定。")
+            return
+        lines = ["当前语录绑定："]
+        lines.extend(f'- “{binding.tag}” → @{binding.qq}' for binding in bindings)
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("绑定")
+    async def bind_quote_tag(self, event: AstrMessageEvent, tag: str = ""):
+        qq = self.quote_service.extract_at_qq(event) or ""
+        if not is_valid_qq(qq):
+            yield event.plain_result("请使用：/绑定 @某人 tag")
+            return
+        resolved_tag = self._extract_binding_tag(event, qq, tag)
+        error = self._binding_tag_error(resolved_tag)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        session_key = self._session_key(event)
+        status, detail = await self.repository.create_binding(session_key, qq, resolved_tag)
+        if status == "created":
+            self.quote_service.schedule_binding_pre_render(event, session_key, qq, resolved_tag)
+            yield event.plain_result(f'已绑定：“{resolved_tag}” → @{qq}')
+        elif status == "unchanged":
+            yield event.plain_result(f'该用户已经绑定到“{detail}”。')
+        elif status == "qq_exists":
+            yield event.plain_result(f'@{qq} 已绑定到“{detail}”，请使用 /重新绑定 修改。')
+        elif status == "tag_exists":
+            yield event.plain_result(f'标签“{resolved_tag}”已绑定到 @{detail}。')
+        else:
+            yield event.plain_result("绑定失败，请稍后重试。")
+
+    @filter.command("重新绑定")
+    async def rebind_quote_tag(self, event: AstrMessageEvent, tag: str = ""):
+        qq = self.quote_service.extract_at_qq(event) or ""
+        if not is_valid_qq(qq):
+            yield event.plain_result("请使用：/重新绑定 @某人 tag；省略 tag 可取消绑定。")
+            return
+        resolved_tag = self._extract_binding_tag(event, qq, tag)
+        if resolved_tag:
+            error = self._binding_tag_error(resolved_tag)
+            if error:
+                yield event.plain_result(error)
+                return
+
+        session_key = self._session_key(event)
+        status, detail = await self.repository.rebind(session_key, qq, resolved_tag)
+        if status == "updated":
+            await self.quote_service.remove_signature_cache(session_key, qq, detail)
+            self.quote_service.schedule_binding_pre_render(event, session_key, qq, resolved_tag)
+            yield event.plain_result(f'已重新绑定：“{resolved_tag}” → @{qq}')
+        elif status == "removed":
+            await self.quote_service.remove_signature_cache(session_key, qq, detail)
+            yield event.plain_result(f'已取消 @{qq} 的绑定“{detail}”。')
+        elif status == "unchanged":
+            yield event.plain_result(f'绑定未变化：@{qq} 仍绑定到“{detail}”。')
+        elif status == "not_found":
+            yield event.plain_result(f'@{qq} 尚未绑定，请先使用 /绑定。')
+        elif status == "tag_exists":
+            yield event.plain_result(f'标签“{resolved_tag}”已绑定到 @{detail}。')
+        else:
+            yield event.plain_result("重新绑定失败，请稍后重试。")
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def random_quote_on_binding(self, event: AstrMessageEvent):
+        self_id = self._get_self_id(event)
+        if self_id and str(event.get_sender_id()) == self_id:
+            return
+        tag = self.quote_service.extract_exact_plain_text(event)
+        if not tag:
+            return
+        binding = self.repository.get_binding_by_tag(self._session_key(event), tag)
+        if binding is None:
+            return
+        response = await self.quote_service.random_quote(
+            event,
+            uid=binding.qq,
+            silent_if_empty=True,
+            signature_override=binding.tag,
+        )
+        for item in self._emit_response(event, response):
+            yield item
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def random_quote_on_poke(self, event: AstrMessageEvent):
@@ -195,6 +285,44 @@ class QuotesPlugin(Star):
 
     def _session_key(self, event: AstrMessageEvent) -> str:
         return make_session_key(event.get_group_id(), event.get_sender_id())
+
+    def _extract_binding_tag(
+        self,
+        event: AstrMessageEvent,
+        target_qq: str,
+        supplied_tag: str = "",
+    ) -> str:
+        try:
+            found_target = False
+            plain_parts: list[str] = []
+            for segment in event.get_messages():
+                if isinstance(segment, Comp.At):
+                    segment_qq = str(getattr(segment, "qq", "") or "")
+                    if found_target:
+                        break
+                    found_target = segment_qq == target_qq
+                    continue
+                if found_target:
+                    if not isinstance(segment, Comp.Plain):
+                        break
+                    text = str(getattr(segment, "text", "") or "").strip()
+                    if text:
+                        plain_parts.append(text)
+        except Exception:
+            found_target = False
+            plain_parts = []
+        if found_target:
+            return " ".join(plain_parts).strip()
+        return str(supplied_tag or "").strip()
+
+    def _binding_tag_error(self, tag: str) -> str:
+        if not tag:
+            return "tag 不能为空，请使用：/绑定 @某人 tag"
+        if "\n" in tag or "\r" in tag:
+            return "tag 不能包含换行。"
+        if len(tag) > 64:
+            return "tag 不能超过 64 个字符。"
+        return ""
 
     def _create_http_client(self):
         try:

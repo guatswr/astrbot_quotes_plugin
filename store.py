@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
@@ -175,8 +176,26 @@ class SessionStore:
     def media_abs_path(self, file_name: str) -> Path:
         return self.media_dir / file_name
 
-    def cache_path(self, quote_id: str) -> Path:
-        return self.cache_dir / f"{quote_id}.png"
+    def cache_path(self, quote_id: str, variant: str = "") -> Path:
+        if not variant:
+            return self.cache_dir / f"{quote_id}.png"
+        digest = hashlib.sha256(variant.encode("utf-8")).hexdigest()[:16]
+        return self.cache_dir / f"{quote_id}.{digest}.png"
+
+    def cache_paths(self, quote_id: str) -> list[Path]:
+        default_name = f"{quote_id}.png"
+        variant_prefix = f"{quote_id}."
+        if not self.cache_dir.exists():
+            return []
+        return [
+            path
+            for path in self.cache_dir.iterdir()
+            if path.is_file()
+            and (
+                path.name == default_name
+                or (path.name.startswith(variant_prefix) and path.suffix.lower() == ".png")
+            )
+        ]
 
     def load_sent_records(self) -> list[SentQuoteRecord]:
         payload = read_json(

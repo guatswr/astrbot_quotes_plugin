@@ -86,7 +86,7 @@ class QuoteService:
         self.blacklist = blacklist
         self._render_semaphore = asyncio.Semaphore(1)
         self._render_tasks: set[asyncio.Task[bool]] = set()
-        self._render_inflight: dict[str, asyncio.Task[bool]] = {}
+        self._render_inflight: dict[tuple[str, str], asyncio.Task[bool]] = {}
 
     async def add_quote(self, event: Any, uid: str = "") -> CommandResponse:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -169,6 +169,16 @@ class QuoteService:
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
         self.schedule_pre_render(event, quote)
+        bindings = []
+        if target_qq:
+            bindings = (
+                self.repository.list_bindings_for_qq_global(target_qq)
+                if self.global_mode
+                else [self.repository.get_binding_for_qq(session_key, target_qq)]
+            )
+        for binding in bindings:
+            if binding is not None:
+                self.schedule_pre_render(event, quote, signature_override=binding.tag)
 
         image_count = len([segment for segment in all_segments if segment.type == "image"])
         logger.info(
@@ -258,7 +268,13 @@ class QuoteService:
             text=f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。",
         )
 
-    async def random_quote(self, event: Any, uid: str = "", silent_if_empty: bool = False) -> CommandResponse | None:
+    async def random_quote(
+        self,
+        event: Any,
+        uid: str = "",
+        silent_if_empty: bool = False,
+        signature_override: str = "",
+    ) -> CommandResponse | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
         target_session = None if self.global_mode else session_key
         explicit_qq = uid.strip() if is_valid_qq(uid) else ""
@@ -299,7 +315,7 @@ class QuoteService:
             )
 
         store = self.repository.get_store(quote.group)
-        cache_path = store.cache_path(quote.id)
+        cache_path = store.cache_path(quote.id, signature_override)
         if self.render_cache and cache_path.exists():
             return CommandResponse(
                 kind="image_path",
@@ -309,10 +325,8 @@ class QuoteService:
             )
 
         if not self.render_cache:
-            signature = await self.napcat_service.resolve_signature_name(
-                event,
-                quote,
-                use_group_signature=self.image_signature_use_group,
+            signature = signature_override or await self.napcat_service.resolve_signature_name(
+                event, quote, use_group_signature=self.image_signature_use_group
             )
             rendered_url = await self.renderer.render_quote_image(quote, signature)
             return CommandResponse(
@@ -322,7 +336,11 @@ class QuoteService:
                 delete_fingerprint=await self._fingerprint_image_url(rendered_url),
             )
 
-        render_task = self._get_or_create_render_task(event, quote)
+        render_task = self._get_or_create_render_task(
+            event,
+            quote,
+            signature_override=signature_override,
+        )
         try:
             cached = await asyncio.wait_for(
                 asyncio.shield(render_task),
@@ -356,16 +374,46 @@ class QuoteService:
         )
 
     async def delete_quote(self, quote_id: str) -> bool:
-        task = self._render_inflight.get(quote_id)
-        if task is not None and not task.done():
+        tasks = [
+            task
+            for (task_quote_id, _), task in self._render_inflight.items()
+            if task_quote_id == quote_id and not task.done()
+        ]
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         return await self.repository.delete_quote(quote_id)
 
-    def schedule_pre_render(self, event: Any, quote: Quote) -> None:
+    def schedule_pre_render(
+        self,
+        event: Any,
+        quote: Quote,
+        *,
+        signature_override: str = "",
+    ) -> None:
         if not self._should_render_quote(quote):
             return
-        self._get_or_create_render_task(event, quote)
+        self._get_or_create_render_task(
+            event,
+            quote,
+            signature_override=signature_override,
+        )
+
+    def schedule_binding_pre_render(
+        self,
+        event: Any,
+        session_key: str,
+        qq: str,
+        tag: str,
+    ) -> None:
+        quotes = (
+            self.repository.list_quotes_for_owner_global(qq)
+            if self.global_mode
+            else self.repository.list_quotes_for_owner(session_key, qq)
+        )
+        for quote in quotes:
+            self.schedule_pre_render(event, quote, signature_override=tag)
 
     def _should_render_quote(self, quote: Quote) -> bool:
         if self.text_mode or not self.render_cache or quote.kind != "standard":
@@ -377,48 +425,94 @@ class QuoteService:
             for segment in quote.segments
         )
 
-    def _get_or_create_render_task(self, event: Any, quote: Quote) -> asyncio.Task[bool]:
-        existing = self._render_inflight.get(quote.id)
+    def _get_or_create_render_task(
+        self,
+        event: Any,
+        quote: Quote,
+        *,
+        signature_override: str = "",
+    ) -> asyncio.Task[bool]:
+        task_key = (quote.id, signature_override)
+        existing = self._render_inflight.get(task_key)
         if existing is not None and not existing.done():
             return existing
         task = asyncio.create_task(
-            self._render_quote_to_cache(event, quote),
+            self._render_quote_to_cache(
+                event,
+                quote,
+                signature_override=signature_override,
+            ),
             name=f"quotes-pre-render-{quote.id}",
         )
-        self._render_inflight[quote.id] = task
+        self._render_inflight[task_key] = task
         self._render_tasks.add(task)
-        task.add_done_callback(lambda done, quote_id=quote.id: self._finish_render_task(quote_id, done))
+        task.add_done_callback(lambda done, key=task_key: self._finish_render_task(key, done))
         return task
 
-    def _finish_render_task(self, quote_id: str, task: asyncio.Task[bool]) -> None:
+    def _finish_render_task(self, task_key: tuple[str, str], task: asyncio.Task[bool]) -> None:
         self._render_tasks.discard(task)
-        if self._render_inflight.get(quote_id) is task:
-            self._render_inflight.pop(quote_id, None)
+        if self._render_inflight.get(task_key) is task:
+            self._render_inflight.pop(task_key, None)
         if task.cancelled():
             return
         try:
             task.result()
         except Exception as exc:
-            logger.warning(f"语录后台预渲染失败: quote_id={quote_id}, error={exc}")
+            logger.warning(f"语录后台预渲染失败: quote_id={task_key[0]}, error={exc}")
 
-    async def _render_quote_to_cache(self, event: Any, quote: Quote) -> bool:
+    async def _render_quote_to_cache(
+        self,
+        event: Any,
+        quote: Quote,
+        *,
+        signature_override: str = "",
+    ) -> bool:
         store = self.repository.get_store(quote.group)
-        cache_path = store.cache_path(quote.id)
+        cache_path = store.cache_path(quote.id, signature_override)
         if cache_path.exists():
             return True
         async with self._render_semaphore:
             if cache_path.exists():
                 return True
-            signature = await self.napcat_service.resolve_signature_name(
-                event,
-                quote,
-                use_group_signature=self.image_signature_use_group,
+            signature = signature_override or await self.napcat_service.resolve_signature_name(
+                event, quote, use_group_signature=self.image_signature_use_group
             )
             rendered_url = await self.renderer.render_quote_image(quote, signature)
             cached = await self.cache_rendered_result(rendered_url, cache_path)
             if cached:
                 logger.info(f"语录后台预渲染完成: quote_id={quote.id}, cache={cache_path}")
             return cached
+
+    async def remove_signature_cache(self, session_key: str, qq: str, signature: str) -> None:
+        if not signature:
+            return
+        quotes = (
+            self.repository.list_quotes_for_owner_global(qq)
+            if self.global_mode
+            else self.repository.list_quotes_for_owner(session_key, qq)
+        )
+        tasks: list[asyncio.Task[bool]] = []
+        for quote in quotes:
+            task = self._render_inflight.get((quote.id, signature))
+            if task is not None and not task.done():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        paths = [
+            self.repository.get_store(quote.group).cache_path(quote.id, signature)
+            for quote in quotes
+        ]
+
+        def remove_paths() -> None:
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.info(f"删除旧标签渲染缓存失败: path={path}, error={exc}")
+
+        await asyncio.to_thread(remove_paths)
 
     async def shutdown(self) -> None:
         tasks = [task for task in self._render_tasks if not task.done()]
@@ -702,6 +796,18 @@ class QuoteService:
         except Exception as exc:
             logger.warning(f"解析 @ 失败: {exc}")
         return None
+
+    def extract_exact_plain_text(self, event: Any) -> str | None:
+        try:
+            segments = list(event.get_messages())
+        except Exception:
+            return None
+        if Comp is None or not segments:
+            return None
+        if any(not isinstance(segment, Comp.Plain) for segment in segments):
+            return None
+        text = "".join(str(getattr(segment, "text", "") or "") for segment in segments).strip()
+        return text or None
 
     def get_reply_message_id(self, event: Any) -> str | None:
         try:

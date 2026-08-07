@@ -278,6 +278,15 @@ class MediaAsset:
 
 
 @dataclass(slots=True)
+class QuoteBinding:
+    session_key: str
+    qq: str
+    tag: str
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(slots=True)
 class PreparedImage:
     content: bytes
     extension: str

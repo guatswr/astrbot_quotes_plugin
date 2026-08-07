@@ -37,6 +37,7 @@ try:
         PendingQuoteSegment,
         PreparedImage,
         Quote,
+        QuoteBinding,
         QuoteSegment,
         SentQuoteRecord,
     )
@@ -62,6 +63,7 @@ except ImportError:  # pragma: no cover
         PendingQuoteSegment,
         PreparedImage,
         Quote,
+        QuoteBinding,
         QuoteSegment,
         SentQuoteRecord,
     )
@@ -199,7 +201,26 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                     ON sent_records(quote_id);
                     """
                 )
-                connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+                current_version = 1
+                connection.execute("PRAGMA user_version = 1")
+            if current_version < 2:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS quote_bindings (
+                        session_key TEXT NOT NULL,
+                        qq TEXT NOT NULL,
+                        tag TEXT NOT NULL,
+                        created_at REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL DEFAULT 0,
+                        PRIMARY KEY(session_key, qq),
+                        UNIQUE(session_key, tag)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bindings_tag
+                    ON quote_bindings(session_key, tag);
+                    """
+                )
+                current_version = 2
+                connection.execute("PRAGMA user_version = 2")
             connection.commit()
 
     def session_keys(self) -> list[str]:
@@ -208,6 +229,166 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 "SELECT DISTINCT session_key FROM quotes ORDER BY session_key"
             ).fetchall()
         return [str(row["session_key"]) for row in rows]
+
+    def _row_to_binding(self, row: sqlite3.Row) -> QuoteBinding:
+        return QuoteBinding(
+            session_key=str(row["session_key"]),
+            qq=str(row["qq"]),
+            tag=str(row["tag"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def get_binding_by_tag(self, session_key: str, tag: str) -> QuoteBinding | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM quote_bindings
+                WHERE session_key = ? AND tag = ?
+                LIMIT 1
+                """,
+                (session_key, tag),
+            ).fetchone()
+        return self._row_to_binding(row) if row is not None else None
+
+    def get_binding_for_qq(self, session_key: str, qq: str) -> QuoteBinding | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM quote_bindings
+                WHERE session_key = ? AND qq = ?
+                LIMIT 1
+                """,
+                (session_key, str(qq)),
+            ).fetchone()
+        return self._row_to_binding(row) if row is not None else None
+
+    def list_bindings(self, session_key: str) -> list[QuoteBinding]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM quote_bindings
+                WHERE session_key = ?
+                ORDER BY tag, qq
+                """,
+                (session_key,),
+            ).fetchall()
+        return [self._row_to_binding(row) for row in rows]
+
+    def list_bindings_for_qq_global(self, qq: str) -> list[QuoteBinding]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM quote_bindings
+                WHERE qq = ?
+                ORDER BY session_key, tag
+                """,
+                (str(qq),),
+            ).fetchall()
+        return [self._row_to_binding(row) for row in rows]
+
+    async def create_binding(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
+        if not session_key or not qq or not str(tag).strip():
+            return "invalid", ""
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._create_binding_sync,
+                session_key,
+                str(qq),
+                str(tag).strip(),
+            )
+
+    def _create_binding_sync(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM quote_bindings WHERE session_key = ? AND qq = ?",
+                (session_key, qq),
+            ).fetchone()
+            if existing is not None:
+                connection.rollback()
+                existing_tag = str(existing["tag"])
+                return ("unchanged", existing_tag) if existing_tag == tag else ("qq_exists", existing_tag)
+            tag_owner = connection.execute(
+                "SELECT qq FROM quote_bindings WHERE session_key = ? AND tag = ?",
+                (session_key, tag),
+            ).fetchone()
+            if tag_owner is not None:
+                connection.rollback()
+                return "tag_exists", str(tag_owner["qq"])
+            now = time()
+            connection.execute(
+                """
+                INSERT INTO quote_bindings (
+                    session_key, qq, tag, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_key, qq, tag, now, now),
+            )
+            connection.commit()
+            return "created", tag
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    async def rebind(self, session_key: str, qq: str, tag: str = "") -> tuple[str, str]:
+        if not session_key or not qq:
+            return "invalid", ""
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._rebind_sync,
+                session_key,
+                str(qq),
+                str(tag).strip(),
+            )
+
+    def _rebind_sync(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM quote_bindings WHERE session_key = ? AND qq = ?",
+                (session_key, qq),
+            ).fetchone()
+            if existing is None:
+                connection.rollback()
+                return "not_found", ""
+            old_tag = str(existing["tag"])
+            if not tag:
+                connection.execute(
+                    "DELETE FROM quote_bindings WHERE session_key = ? AND qq = ?",
+                    (session_key, qq),
+                )
+                connection.commit()
+                return "removed", old_tag
+            if tag == old_tag:
+                connection.rollback()
+                return "unchanged", old_tag
+            tag_owner = connection.execute(
+                "SELECT qq FROM quote_bindings WHERE session_key = ? AND tag = ?",
+                (session_key, tag),
+            ).fetchone()
+            if tag_owner is not None:
+                connection.rollback()
+                return "tag_exists", str(tag_owner["qq"])
+            connection.execute(
+                """
+                UPDATE quote_bindings
+                SET tag = ?, updated_at = ?
+                WHERE session_key = ? AND qq = ?
+                """,
+                (tag, time(), session_key, qq),
+            )
+            connection.commit()
+            return "updated", old_tag
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _row_to_quote(self, row: sqlite3.Row) -> Quote:
         return Quote.from_dict(
@@ -273,6 +454,14 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             rows = connection.execute(
                 "SELECT * FROM quotes WHERE session_key = ? AND qq = ? ORDER BY created_at, id",
                 (session_key, str(qq)),
+            ).fetchall()
+        return [self._row_to_quote(row) for row in rows]
+
+    def list_quotes_for_owner_global(self, qq: str) -> list[Quote]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM quotes WHERE qq = ? ORDER BY created_at, id",
+                (str(qq),),
             ).fetchall()
         return [self._row_to_quote(row) for row in rows]
 
@@ -746,7 +935,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
     def _delete_quote_sync(self, quote_id: str) -> bool:
         connection = self._connect()
         files_to_remove: list[Path] = []
-        cache_path: Path | None = None
+        cache_paths: list[Path] = []
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM quotes WHERE id = ?", (quote_id,)).fetchone()
@@ -754,7 +943,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 connection.rollback()
                 return False
             quote = self._row_to_quote(row)
-            cache_path = self.get_store(quote.group).cache_path(quote_id)
+            cache_paths = self.get_store(quote.group).cache_paths(quote_id)
 
             for asset_id, count in Counter(quote.image_ids).items():
                 connection.execute(
@@ -798,7 +987,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 logger.info(f"删除语录资源文件失败: path={path}, error={exc}")
-        if cache_path is not None:
+        for cache_path in cache_paths:
             try:
                 cache_path.unlink(missing_ok=True)
             except OSError as exc:
