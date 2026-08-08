@@ -4,13 +4,16 @@ import asyncio
 import base64
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import quote_service as quote_service_module
+from PIL import Image as PillowImage
 from models import PendingQuoteSegment, Quote, QuoteSegment
 from quote_service import QuoteService
 from sqlite_store import QuoteRepository
+from utils import prepare_image
 
 
 class FakeEvent:
@@ -57,6 +60,19 @@ class FakeImage:
 class FakeImageService:
     async def build_reply_segments(self, event: object, message: object) -> list[PendingQuoteSegment]:
         return [PendingQuoteSegment(type="text", text="后台渲染测试")]
+
+    async def build_current_segments(self, event: object, **kwargs: object) -> list[PendingQuoteSegment]:
+        return []
+
+
+class GalleryImageService:
+    def __init__(self) -> None:
+        source = BytesIO()
+        PillowImage.new("RGB", (64, 48), (30, 60, 90)).save(source, format="PNG")
+        self.prepared = prepare_image(source.getvalue(), source="gallery.png")
+
+    async def build_reply_segments(self, event: object, message: object) -> list[PendingQuoteSegment]:
+        return [PendingQuoteSegment(type="image", image=self.prepared)]
 
     async def build_current_segments(self, event: object, **kwargs: object) -> list[PendingQuoteSegment]:
         return []
@@ -235,7 +251,7 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
 
             response = await service.add_quote(FakeEvent())
             self.assertEqual(response.kind, "plain")
-            self.assertIn("我学会啦，来问问我吧！", response.text)
+            self.assertEqual(response.text, "我学会啦，来问问我吧！高性能ですから~")
             self.assertTrue(service._render_tasks)
             await asyncio.wait_for(renderer.started.wait(), timeout=1.0)
             self.assertTrue(any(not task.done() for task in service._render_tasks))
@@ -254,6 +270,49 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(warm_response.kind, "image_path")
             self.assertEqual(Path(warm_response.path), cache_path)
             await service.shutdown()
+
+    async def test_gallery_upload_and_random_response(self) -> None:
+        original_components = quote_service_module.Comp
+        quote_service_module.Comp = type(
+            "Components",
+            (),
+            {"Plain": FakePlain, "Image": FakeImage},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = QuoteRepository(root)
+            service = QuoteService(
+                repository=repository,
+                image_service=GalleryImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=CapturingRenderer(root / "unused.png"),
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+            try:
+                response = await service.add_quote(FakeEvent(), uid="曼彻斯特咖啡")
+                self.assertEqual(response.kind, "plain")
+                self.assertEqual(response.text, "我学会啦，来问问我吧！高性能ですから~")
+                self.assertEqual(repository.list_quotes("123456"), [])
+
+                gallery_response = await service.random_gallery_response(
+                    "123456",
+                    "今天来杯曼彻斯特咖啡",
+                )
+                self.assertIsNotNone(gallery_response)
+                self.assertEqual(gallery_response.kind, "chain")
+                self.assertEqual(len(gallery_response.chain), 1)
+                self.assertTrue(gallery_response.chain[0].file.startswith("base64://"))
+                self.assertIsNone(
+                    await service.random_gallery_response("123456", "没有关键词")
+                )
+            finally:
+                await service.shutdown()
+                quote_service_module.Comp = original_components
 
     async def test_missing_owner_quote_uses_memory_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

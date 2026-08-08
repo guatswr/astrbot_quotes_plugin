@@ -98,8 +98,18 @@ class QuoteService:
         reply_payload = await self.napcat_service.fetch_onebot_message(event, reply_message_id)
         reply_sender = reply_payload.get("sender") or {}
         reply_qq = str(reply_sender.get("user_id") or reply_sender.get("qq") or "")
-        explicit_qq = uid.strip() if is_valid_qq(uid) else ""
         mention_qq = self.extract_at_qq(event) or ""
+        raw_target = str(uid or "").strip()
+        explicit_qq = raw_target if is_valid_qq(raw_target) else ""
+        gallery_keyword = raw_target if raw_target and not explicit_qq and not mention_qq else ""
+
+        if gallery_keyword:
+            return await self._add_gallery_images(
+                event,
+                session_key=session_key,
+                keyword=gallery_keyword,
+                reply_message=reply_payload.get("message"),
+            )
 
         forward_id, forward_payload = self.napcat_service.extract_forward_reference(reply_payload.get("message"))
         if forward_id or forward_payload:
@@ -191,17 +201,52 @@ class QuoteService:
             f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, "
             f"segments={len(all_segments)}, images={image_count}"
         )
-        if image_count:
-            return CommandResponse(
-                kind="plain",
-                text=self._upload_success_text(
-                    f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。"
-                ),
-            )
         return CommandResponse(
             kind="plain",
-            text=self._upload_success_text(f"已收录 {quote.name} 的语录：{quote.text}"),
+            text=self._upload_success_text(),
         )
+
+    async def _add_gallery_images(
+        self,
+        event: Any,
+        *,
+        session_key: str,
+        keyword: str,
+        reply_message: Any,
+    ) -> CommandResponse:
+        error = self._gallery_keyword_error(keyword)
+        if error:
+            return CommandResponse(kind="plain", text=error)
+
+        reply_segments = await self.image_service.build_reply_segments(event, reply_message)
+        current_segments = await self.image_service.build_current_segments(
+            event,
+            command_name="上传",
+            explicit_qq=keyword,
+        )
+        images = [
+            segment.image
+            for segment in [*reply_segments, *current_segments]
+            if segment.type == "image" and segment.image is not None
+        ]
+        if not images:
+            return CommandResponse(
+                kind="plain",
+                text="请回复或附带图片后使用：/上传 图库关键词",
+            )
+
+        added, skipped = await self.repository.add_gallery_images(
+            session_key,
+            keyword,
+            images,
+        )
+        if added == 0:
+            return CommandResponse(kind="plain", text="这个图库里已经有这些图片啦。")
+        logger.info(
+            "图库图片上传成功: "
+            f"session={session_key}, keyword={keyword}, added={added}, skipped={skipped}"
+        )
+        return CommandResponse(kind="plain", text=UPLOAD_SUCCESS_PROMPT)
 
     async def _add_forward_quote(
         self,
@@ -278,9 +323,7 @@ class QuoteService:
         )
         return CommandResponse(
             kind="plain",
-            text=self._upload_success_text(
-                f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。"
-            ),
+            text=self._upload_success_text(),
         )
 
     async def random_quote(
@@ -384,8 +427,19 @@ class QuoteService:
             )
         return self._plain_quote_response(quote, effective_signature)
 
-    def _upload_success_text(self, detail: str) -> str:
-        return f"{detail}\n{UPLOAD_SUCCESS_PROMPT}"
+    def _upload_success_text(self) -> str:
+        return UPLOAD_SUCCESS_PROMPT
+
+    def _gallery_keyword_error(self, keyword: str) -> str:
+        if not str(keyword or "").strip():
+            return "图库关键词不能为空。"
+        if "\n" in keyword or "\r" in keyword:
+            return "图库关键词不能包含换行。"
+        if len(keyword) > 64:
+            return "图库关键词不能超过 64 个字符。"
+        if keyword.startswith("/"):
+            return "图库关键词不能以 / 开头。"
+        return ""
 
     async def delete_quote(self, quote_id: str) -> bool:
         tasks = [
@@ -673,6 +727,49 @@ class QuoteService:
         if safe_page < total_pages:
             lines.append(f"发送 /语录列表 {safe_page + 1} 查看下一页。")
         return "\n".join(lines)
+
+    async def build_quote_ranking_text(self, session_key: str) -> str:
+        rankings = await asyncio.to_thread(self.repository.quote_rankings, session_key)
+        if not rankings:
+            return "当前会话还没有收录语录。"
+        lines = ["当前会话语录排名："]
+        lines.extend(
+            f"{index}. {display_name}：{quote_count} 条"
+            for index, (_, display_name, quote_count) in enumerate(rankings, start=1)
+        )
+        return "\n".join(lines)
+
+    async def random_gallery_response(
+        self,
+        session_key: str,
+        message_text: str,
+    ) -> CommandResponse | None:
+        selected = await asyncio.to_thread(
+            self.repository.random_gallery_image,
+            session_key,
+            message_text,
+        )
+        if selected is None:
+            return None
+        keyword, asset = selected
+        abs_path = self.repository.root / asset.rel_path
+        try:
+            image_bytes = await asyncio.to_thread(
+                normalize_image_file_for_send,
+                abs_path,
+            )
+            if Comp is None:
+                return None
+            return CommandResponse(
+                kind="chain",
+                chain=[Comp.Image.fromBytes(image_bytes)],
+            )
+        except Exception as exc:
+            logger.warning(
+                "图库图片规范化失败: "
+                f"session={session_key}, keyword={keyword}, path={abs_path}, error={exc}"
+            )
+            return CommandResponse(kind="plain", text="[图库图片暂时无法发送]")
 
     def _quote_list_summary(self, quote: Quote, max_length: int = 56) -> str:
         text = " ".join(str(quote.text or "").split())

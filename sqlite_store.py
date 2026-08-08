@@ -221,6 +221,27 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 )
                 current_version = 2
                 connection.execute("PRAGMA user_version = 2")
+            if current_version < 3:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS gallery_images (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_key TEXT NOT NULL,
+                        keyword TEXT NOT NULL,
+                        asset_id TEXT NOT NULL,
+                        created_at REAL NOT NULL DEFAULT 0,
+                        random_key INTEGER NOT NULL,
+                        UNIQUE(session_key, keyword, asset_id),
+                        FOREIGN KEY(asset_id) REFERENCES image_assets(asset_id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_gallery_keyword_random
+                    ON gallery_images(session_key, keyword, random_key);
+                    CREATE INDEX IF NOT EXISTS idx_gallery_asset
+                    ON gallery_images(asset_id);
+                    """
+                )
+                current_version = 3
+                connection.execute("PRAGMA user_version = 3")
             connection.commit()
 
     def session_keys(self) -> list[str]:
@@ -490,6 +511,46 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             ).fetchall()
         return total, [self._row_to_quote(row) for row in rows]
 
+    def quote_rankings(self, session_key: str) -> list[tuple[str, str, int]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    q.qq AS qq,
+                    COALESCE(
+                        NULLIF(b.tag, ''),
+                        NULLIF((
+                            SELECT q2.name
+                            FROM quotes AS q2
+                            WHERE q2.session_key = q.session_key
+                              AND (
+                                  (q.qq <> '' AND q2.qq = q.qq)
+                                  OR (
+                                      q.qq = '' AND q2.qq = ''
+                                      AND q2.name = q.name
+                                  )
+                              )
+                            ORDER BY q2.created_at DESC, q2.id DESC
+                            LIMIT 1
+                        ), ''),
+                        NULLIF(q.qq, ''),
+                        '未知用户'
+                    ) AS display_name,
+                    COUNT(*) AS quote_count
+                FROM quotes AS q
+                LEFT JOIN quote_bindings AS b
+                  ON b.session_key = q.session_key AND b.qq = q.qq
+                WHERE q.session_key = ?
+                GROUP BY q.qq, CASE WHEN q.qq = '' THEN q.name ELSE '' END, b.tag
+                ORDER BY quote_count DESC, display_name, q.qq
+                """,
+                (session_key,),
+            ).fetchall()
+        return [
+            (str(row["qq"]), str(row["display_name"]), int(row["quote_count"]))
+            for row in rows
+        ]
+
     def list_quotes_for_owner(self, session_key: str, qq: str) -> list[Quote]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -632,6 +693,153 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 asset.created_at,
             ),
         )
+
+    async def add_gallery_images(
+        self,
+        session_key: str,
+        keyword: str,
+        images: list[PreparedImage],
+    ) -> tuple[int, int]:
+        normalized_keyword = str(keyword or "").strip()
+        valid_images = [image for image in images if image is not None and image.content]
+        if not session_key or not normalized_keyword or not valid_images:
+            return 0, 0
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._add_gallery_images_sync,
+                session_key,
+                normalized_keyword,
+                valid_images,
+            )
+
+    def _add_gallery_images_sync(
+        self,
+        session_key: str,
+        keyword: str,
+        images: list[PreparedImage],
+    ) -> tuple[int, int]:
+        store = self.get_store(session_key)
+        created_files: list[Path] = []
+        connection = self._connect()
+        added = 0
+        skipped = 0
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_assets = self._list_image_assets(connection, session_key)
+            created_at = time()
+            for image in images:
+                matched_asset = next(
+                    (
+                        asset
+                        for asset in existing_assets
+                        if is_near_duplicate(
+                            image,
+                            asset.sha256,
+                            asset.dhash,
+                            asset.width,
+                            asset.height,
+                        )
+                    ),
+                    None,
+                )
+                if matched_asset is not None:
+                    existing_mapping = connection.execute(
+                        """
+                        SELECT 1 FROM gallery_images
+                        WHERE session_key = ? AND keyword = ? AND asset_id = ?
+                        LIMIT 1
+                        """,
+                        (session_key, keyword, matched_asset.asset_id),
+                    ).fetchone()
+                    if existing_mapping is not None:
+                        skipped += 1
+                        continue
+                    connection.execute(
+                        "UPDATE image_assets SET ref_count = ref_count + 1 WHERE asset_id = ?",
+                        (matched_asset.asset_id,),
+                    )
+                    asset = matched_asset
+                else:
+                    asset = self._persist_image_asset(
+                        store,
+                        image,
+                        created_at=created_at,
+                        created_files=created_files,
+                    )
+                    self._insert_image_asset(connection, session_key, asset)
+                    existing_assets.append(asset)
+
+                connection.execute(
+                    """
+                    INSERT INTO gallery_images (
+                        session_key, keyword, asset_id, created_at, random_key
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (session_key, keyword, asset.asset_id, created_at, _random_key()),
+                )
+                added += 1
+            connection.commit()
+            return added, skipped
+        except Exception:
+            connection.rollback()
+            for path in created_files:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            connection.close()
+
+    def random_gallery_image(
+        self,
+        session_key: str,
+        message_text: str,
+    ) -> tuple[str, ImageAsset] | None:
+        text = str(message_text or "")
+        if not session_key or not text:
+            return None
+        with self._connection() as connection:
+            keywords = [
+                str(row["keyword"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT keyword FROM gallery_images
+                    WHERE session_key = ?
+                    ORDER BY LENGTH(keyword) DESC, keyword
+                    """,
+                    (session_key,),
+                ).fetchall()
+            ]
+            keyword = next((item for item in keywords if item and item in text), "")
+            if not keyword:
+                return None
+
+            threshold = _random_key()
+            row = connection.execute(
+                """
+                SELECT image_assets.*
+                FROM gallery_images
+                JOIN image_assets USING (asset_id)
+                WHERE gallery_images.session_key = ?
+                  AND gallery_images.keyword = ?
+                  AND gallery_images.random_key >= ?
+                ORDER BY gallery_images.random_key
+                LIMIT 1
+                """,
+                (session_key, keyword, threshold),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT image_assets.*
+                    FROM gallery_images
+                    JOIN image_assets USING (asset_id)
+                    WHERE gallery_images.session_key = ?
+                      AND gallery_images.keyword = ?
+                    ORDER BY gallery_images.random_key
+                    LIMIT 1
+                    """,
+                    (session_key, keyword),
+                ).fetchone()
+        return (keyword, self._image_from_row(row)) if row is not None else None
 
     def _insert_media_asset(self, connection: sqlite3.Connection, session_key: str, asset: MediaAsset, *, ignore: bool = False) -> None:
         clause = "OR IGNORE " if ignore else ""

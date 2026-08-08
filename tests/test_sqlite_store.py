@@ -345,7 +345,64 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             ("not_found", ""),
         )
 
-    async def test_upgrades_sqlite_schema_v1_to_v2(self) -> None:
+    async def test_gallery_reuses_assets_and_matches_longest_keyword(self) -> None:
+        repository = QuoteRepository(self.root)
+        source = BytesIO()
+        PillowImage.new("RGB", (48, 32), (20, 40, 60)).save(source, format="PNG")
+        prepared_image = prepare_image(source.getvalue(), source="gallery.png")
+
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "猫", [prepared_image]),
+            (1, 0),
+        )
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "猫", [prepared_image]),
+            (0, 1),
+        )
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "猫猫", [prepared_image]),
+            (1, 0),
+        )
+
+        selected = repository.random_gallery_image("123456", "今天想看看猫猫")
+        self.assertIsNotNone(selected)
+        keyword, asset = selected
+        self.assertEqual(keyword, "猫猫")
+        self.assertEqual(asset.file_name, f"{asset.asset_id}.jpg")
+        self.assertTrue((self.root / asset.rel_path).exists())
+        self.assertEqual(asset.ref_count, 2)
+        self.assertEqual(len(repository.find_assets("123456", [asset.asset_id])), 1)
+        self.assertIsNone(repository.random_gallery_image("123456", "没有命中"))
+        self.assertEqual(repository.list_quotes("123456"), [])
+
+    async def test_quote_rankings_use_bound_tag(self) -> None:
+        repository = QuoteRepository(self.root)
+        for index, (qq, name) in enumerate(
+            [("10001", "张三"), ("10002", "李四"), ("10001", "张三新昵称")]
+        ):
+            quote = Quote(
+                id=f"q_rank_{index}",
+                qq=qq,
+                name=name,
+                text=f"排名语录 {index}",
+                created_by="20002",
+                created_at=float(index),
+                group="123456",
+                content_fingerprint=f"rank-fingerprint-{index}",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+        await repository.create_binding("123456", "10001", "名言")
+
+        self.assertEqual(
+            repository.quote_rankings("123456"),
+            [("10001", "名言", 2), ("10002", "李四", 1)],
+        )
+
+    async def test_upgrades_sqlite_schema_v1_to_v3(self) -> None:
         repository = QuoteRepository(self.root)
         legacy_quote = Quote(
             id="q_before_binding_schema",
@@ -367,6 +424,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         connection = sqlite3.connect(database_path)
         try:
             connection.execute("DROP TABLE quote_bindings")
+            connection.execute("DROP TABLE gallery_images")
             connection.execute("PRAGMA user_version = 1")
             connection.commit()
         finally:
@@ -391,6 +449,10 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quote_bindings'"
             ).fetchone()
             self.assertIsNotNone(table)
+            gallery_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gallery_images'"
+            ).fetchone()
+            self.assertIsNotNone(gallery_table)
         finally:
             connection.close()
 

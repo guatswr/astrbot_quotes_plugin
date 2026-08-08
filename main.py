@@ -108,6 +108,11 @@ class QuotesPlugin(Star):
         )
         yield event.plain_result(text)
 
+    @filter.command("语录排名")
+    async def rank_quotes(self, event: AstrMessageEvent):
+        text = await self.quote_service.build_quote_ranking_text(self._session_key(event))
+        yield event.plain_result(text)
+
     @filter.command("语录缓存清理")
     async def clear_quote_cache(self, event: AstrMessageEvent):
         removed, failed = await self.quote_service.clear_render_cache(self._session_key(event))
@@ -148,8 +153,10 @@ class QuotesPlugin(Star):
         help_text = (
             "语录插件帮助\n"
             "- 上传：回复消息后发送，保存为语录；可用“上传 @某人”或“上传 QQ号”指定归属。\n"
+            "- 上传 图库关键词：回复或附带图片建立随机图库，普通消息提到关键词时随机发图。\n"
             "- 语录：随机发送语录；可用“语录 @某人”或“语录 QQ号”指定用户。\n"
             "- 语录列表 [页码]：按最新优先查看当前会话的语录。\n"
+            "- 语录排名：按已收录语录数量排名，已绑定用户显示其 tag。\n"
             "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
             "- 绑定 @某人 tag：发送纯文本 tag 时随机该用户的语录。\n"
             "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
@@ -242,6 +249,30 @@ class QuotesPlugin(Star):
             uid=binding.qq,
             silent_if_empty=False,
             signature_override=binding.tag,
+        )
+        for item in self._emit_response(event, response):
+            yield item
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def random_image_on_gallery_keyword(self, event: AstrMessageEvent):
+        self_id = self._get_self_id(event)
+        if self_id and str(event.get_sender_id()) == self_id:
+            return
+        message_text = self.quote_service.extract_exact_plain_text(event)
+        if not message_text:
+            return
+        if message_text.startswith("/") or any(
+            prefix and message_text.startswith(prefix)
+            for prefix in self._wake_prefixes
+        ):
+            return
+
+        session_key = self._session_key(event)
+        if self.repository.get_binding_by_tag(session_key, message_text) is not None:
+            return
+        response = await self.quote_service.random_gallery_response(
+            session_key,
+            message_text,
         )
         for item in self._emit_response(event, response):
             yield item

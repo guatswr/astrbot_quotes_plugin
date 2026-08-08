@@ -2,7 +2,7 @@ from __future__ import annotations
 
 PLUGIN_NAME = "quotes"
 SCHEMA_VERSION = 3
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 DATABASE_FILENAME = "quotes.sqlite3"
 DUPLICATE_IMAGE_MESSAGE = "语录图片已存在"
 DUPLICATE_QUOTE_MESSAGE = "语录内容已存在"
