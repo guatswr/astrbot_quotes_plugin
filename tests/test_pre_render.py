@@ -40,6 +40,19 @@ class FakePlain:
         self.text = text
 
 
+class FakeReply:
+    def __init__(self, message_id: str = "reply-message"):
+        self.id = message_id
+
+
+class GalleryDeleteEvent(FakeEvent):
+    def get_messages(self) -> list[object]:
+        return [FakeReply()]
+
+    def get_self_id(self) -> str:
+        return "10001"
+
+
 class FakeImage:
     def __init__(self, file: str):
         self.file = file
@@ -146,7 +159,7 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
         quote_service_module.Comp = type(
             "Components",
             (),
-            {"Plain": FakePlain, "Image": FakeImage},
+            {"Plain": FakePlain, "Reply": FakeReply, "Image": FakeImage},
         )
         service = object.__new__(QuoteService)
         quote = Quote(
@@ -228,6 +241,54 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 quote_service_module.Comp = original_components
 
+    async def test_animated_gif_chain_preserves_original_bytes(self) -> None:
+        original_components = quote_service_module.Comp
+        quote_service_module.Comp = type(
+            "Components",
+            (),
+            {"Plain": FakePlain, "Image": FakeImage},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            gif_path = root / "animated.gif"
+            source = BytesIO()
+            first = PillowImage.new("RGBA", (48, 32), (255, 0, 0, 255))
+            second = PillowImage.new("RGBA", (48, 32), (0, 0, 255, 255))
+            first.save(
+                source,
+                format="GIF",
+                save_all=True,
+                append_images=[second],
+                duration=[80, 120],
+                loop=0,
+            )
+            original = source.getvalue()
+            gif_path.write_bytes(original)
+            service = object.__new__(QuoteService)
+            service.repository = SimpleNamespace(
+                root=root,
+                find_assets=lambda group, image_ids: {
+                    "asset-gif": SimpleNamespace(rel_path="animated.gif")
+                },
+            )
+            quote = Quote(
+                id="q_animated_gif",
+                qq="10001",
+                name="GIF 用户",
+                text="",
+                created_by="20002",
+                created_at=1.0,
+                group="123456",
+                image_ids=["asset-gif"],
+                segments=[QuoteSegment(type="image", asset_id="asset-gif")],
+            )
+            try:
+                chain = await service.build_standard_quote_chain(quote, "动图")
+                self.assertEqual(base64.b64decode(chain[0].file[9:]), original)
+                self.assertEqual(chain[-1].text, "\n— 动图")
+            finally:
+                quote_service_module.Comp = original_components
+
     async def test_upload_returns_before_background_render_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -276,7 +337,7 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
         quote_service_module.Comp = type(
             "Components",
             (),
-            {"Plain": FakePlain, "Image": FakeImage},
+            {"Plain": FakePlain, "Reply": FakeReply, "Image": FakeImage},
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -315,6 +376,29 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIsNone(
                     await service.random_gallery_response("123456", "没有关键词")
+                )
+                self.assertEqual(
+                    await service.delete_gallery_image(
+                        GalleryDeleteEvent(),
+                        "曼彻斯特咖啡",
+                    ),
+                    "已从图库“曼彻斯特咖啡”删除这张图片。",
+                )
+                self.assertIsNone(
+                    await service.random_gallery_response("123456", "曼彻斯特咖啡")
+                )
+                response = await service.add_quote(FakeEvent(), uid="曼彻斯特咖啡")
+                self.assertEqual(response.text, "我学会啦，来问问我吧！高性能ですから~")
+                self.assertEqual(
+                    await service.delete_gallery("123456", "曼彻斯特咖啡"),
+                    "已删除图库“曼彻斯特咖啡”，共移除 1 张图片。",
+                )
+                self.assertIsNone(
+                    await service.random_gallery_response("123456", "曼彻斯特咖啡")
+                )
+                self.assertEqual(
+                    await service.delete_gallery("123456", "曼彻斯特咖啡"),
+                    "当前会话没有名为“曼彻斯特咖啡”的图库。",
                 )
             finally:
                 await service.shutdown()

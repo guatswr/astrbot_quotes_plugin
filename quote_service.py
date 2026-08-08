@@ -770,6 +770,75 @@ class QuoteService:
             )
             return CommandResponse(kind="plain", text="[图库图片暂时无法发送]")
 
+    async def delete_gallery(self, session_key: str, keyword: str) -> str:
+        normalized_keyword = str(keyword or "").strip()
+        error = self._gallery_keyword_error(normalized_keyword)
+        if error:
+            return "请使用：/图库删除 关键词"
+        deleted, removed_files = await self.repository.delete_gallery(
+            session_key,
+            normalized_keyword,
+        )
+        if deleted == 0:
+            return f'当前会话没有名为“{normalized_keyword}”的图库。'
+        logger.info(
+            "图库删除成功: "
+            f"session={session_key}, keyword={normalized_keyword}, "
+            f"images={deleted}, removed_files={removed_files}"
+        )
+        return f'已删除图库“{normalized_keyword}”，共移除 {deleted} 张图片。'
+
+    async def delete_gallery_image(self, event: Any, keyword: str) -> str:
+        normalized_keyword = str(keyword or "").strip()
+        if self._gallery_keyword_error(normalized_keyword):
+            return "请使用：回复机器人发送的图库图片后发送 /图库图片删除 关键词"
+
+        reply_message_id = self.get_reply_message_id(event)
+        if not reply_message_id:
+            return "请先回复机器人发送的单张图库图片。"
+        reply_payload = await self.napcat_service.fetch_onebot_message(
+            event,
+            reply_message_id,
+        )
+        if not reply_payload:
+            return "未能读取被回复的图库图片，请稍后重试。"
+
+        sender = reply_payload.get("sender") or {}
+        sender_id = str(sender.get("user_id") or sender.get("qq") or "")
+        self_id = self._self_id_of_event(event)
+        if self_id and sender_id and sender_id != self_id:
+            return "只能删除机器人发送的图库图片。"
+
+        segments = await self.image_service.build_reply_segments(
+            event,
+            reply_payload.get("message"),
+        )
+        images = [
+            segment.image
+            for segment in segments
+            if segment.type == "image" and segment.image is not None
+        ]
+        if len(images) != 1:
+            return "被回复的消息必须只包含一张可识别的图库图片。"
+
+        session_key = make_session_key(event.get_group_id(), event.get_sender_id())
+        status, _ = await self.repository.delete_gallery_image(
+            session_key,
+            normalized_keyword,
+            images[0],
+        )
+        if status == "gallery_not_found":
+            return f'当前会话没有名为“{normalized_keyword}”的图库。'
+        if status == "image_not_found":
+            return f'这张图不在图库“{normalized_keyword}”中。'
+        if status != "deleted":
+            return "图库图片删除失败，请稍后重试。"
+        logger.info(
+            "单张图库图片删除成功: "
+            f"session={session_key}, keyword={normalized_keyword}"
+        )
+        return f'已从图库“{normalized_keyword}”删除这张图片。'
+
     def _quote_list_summary(self, quote: Quote, max_length: int = 56) -> str:
         text = " ".join(str(quote.text or "").split())
         if len(text) > max_length:

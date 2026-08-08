@@ -415,6 +415,122 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected_ids[3], selected_ids[0])
         self.assertNotEqual(selected_ids[3], selected_ids[2])
 
+    async def test_delete_gallery_preserves_shared_assets_and_removes_gif(self) -> None:
+        repository = QuoteRepository(self.root)
+
+        static_source = BytesIO()
+        static_image = PillowImage.new("L", (48, 32))
+        for y in range(32):
+            for x in range(48):
+                static_image.putpixel((x, y), 255 if (x + y) % 2 else 0)
+        static_image.save(static_source, format="PNG")
+        shared_image = prepare_image(static_source.getvalue(), source="shared.png")
+
+        gif_source = BytesIO()
+        first = PillowImage.new("RGBA", (80, 32), (255, 0, 0, 255))
+        second = PillowImage.new("RGBA", (80, 32), (0, 0, 255, 255))
+        first.save(
+            gif_source,
+            format="GIF",
+            save_all=True,
+            append_images=[second],
+            duration=[80, 120],
+            loop=0,
+        )
+        original_gif = gif_source.getvalue()
+        animated_image = prepare_image(original_gif, source="animated.gif")
+
+        quote = Quote(
+            id="q_shared_gallery",
+            qq="10001",
+            name="共享用户",
+            text="",
+            created_by="20002",
+            created_at=1.0,
+            group="123456",
+            content_fingerprint="shared-gallery-image",
+        )
+        result = await repository.create_quote_with_segments(
+            "123456",
+            quote,
+            [PendingQuoteSegment(type="image", image=shared_image)],
+        )
+        self.assertIsNotNone(result.quote)
+        shared_asset = repository.find_asset("123456", quote.image_ids[0])
+        shared_path = self.root / shared_asset.rel_path
+
+        self.assertEqual(
+            await repository.add_gallery_images(
+                "123456",
+                "待删除",
+                [shared_image, animated_image],
+            ),
+            (2, 0),
+        )
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "保留", [shared_image]),
+            (1, 0),
+        )
+        await repository.random_gallery_image("123456", "待删除")
+
+        connection = sqlite3.connect(self.root / DATABASE_FILENAME)
+        connection.row_factory = sqlite3.Row
+        try:
+            gif_row = connection.execute(
+                """
+                SELECT image_assets.* FROM gallery_images
+                JOIN image_assets USING (asset_id)
+                WHERE gallery_images.session_key = ?
+                  AND gallery_images.keyword = ?
+                  AND image_assets.file_name LIKE '%.gif'
+                """,
+                ("123456", "待删除"),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(gif_row)
+        gif_path = self.root / str(gif_row["rel_path"])
+        self.assertEqual(gif_path.suffix, ".gif")
+        self.assertEqual(gif_path.read_bytes(), original_gif)
+
+        self.assertEqual(
+            await repository.delete_gallery_image(
+                "123456",
+                "待删除",
+                animated_image,
+            ),
+            ("deleted", True),
+        )
+        self.assertFalse(gif_path.exists())
+        self.assertEqual(repository.gallery_image_count("123456", "待删除"), 1)
+        self.assertEqual(
+            await repository.delete_gallery_image(
+                "123456",
+                "待删除",
+                animated_image,
+            ),
+            ("image_not_found", False),
+        )
+        self.assertEqual(
+            await repository.delete_gallery_image(
+                "123456",
+                "不存在",
+                animated_image,
+            ),
+            ("gallery_not_found", False),
+        )
+
+        self.assertEqual(await repository.delete_gallery("123456", "待删除"), (1, 0))
+        self.assertTrue(shared_path.exists())
+        self.assertIsNone(await repository.random_gallery_image("123456", "待删除"))
+        self.assertIsNotNone(await repository.random_gallery_image("123456", "保留"))
+        self.assertEqual(await repository.delete_gallery("123456", "不存在"), (0, 0))
+
+        self.assertEqual(await repository.delete_gallery("123456", "保留"), (1, 0))
+        self.assertTrue(shared_path.exists())
+        self.assertTrue(await repository.delete_quote(quote.id))
+        self.assertFalse(shared_path.exists())
+
     async def test_quote_rankings_use_bound_tag(self) -> None:
         repository = QuoteRepository(self.root)
         for index, (qq, name) in enumerate(

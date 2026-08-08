@@ -74,6 +74,7 @@ class QuotesPlugin(Star):
         self._cfg_poke_probability = self._parse_probability(self.config.get("poke_probability", 20))
         self._cfg_poke_group_whitelist = self._parse_id_set(self.config.get("poke_group_whitelist") or [])
         self._cfg_poke_group_blacklist = self._parse_id_set(self.config.get("poke_group_blacklist") or [])
+        self._dangerous_confirmations: dict[tuple[str, str, str, str], float] = {}
 
     async def initialize(self):
         await self.repository.migrate_legacy_data()
@@ -148,6 +149,46 @@ class QuotesPlugin(Star):
         else:
             yield event.plain_result("未找到该语录，可能已被删除。")
 
+    @filter.command("图库删除", alias={"删除图库"})
+    async def delete_gallery(self, event: AstrMessageEvent, keyword: str = ""):
+        if not await self._check_admin_permission(event):
+            yield event.plain_result("权限不足：删除整个图库仅限群管理员、群主或 Bot 管理员。")
+            return
+        normalized_keyword = str(keyword or "").strip()
+        if not normalized_keyword:
+            yield event.plain_result("请使用：/图库删除 关键词")
+            return
+        image_count = self.repository.gallery_image_count(
+            self._session_key(event),
+            normalized_keyword,
+        )
+        if image_count == 0:
+            yield event.plain_result(f'当前会话没有名为“{normalized_keyword}”的图库。')
+            return
+        if not self._consume_dangerous_confirmation(
+            event,
+            action="delete_gallery",
+            target=normalized_keyword,
+        ):
+            yield event.plain_result(
+                f'危险操作：将删除图库“{normalized_keyword}”的 {image_count} 张图片。\n'
+                f'请在 60 秒内再次发送：/图库删除 {normalized_keyword}'
+            )
+            return
+        text = await self.quote_service.delete_gallery(
+            self._session_key(event),
+            normalized_keyword,
+        )
+        yield event.plain_result(text)
+
+    @filter.command("图库图片删除", alias={"删除图库图片"})
+    async def delete_gallery_image(self, event: AstrMessageEvent, keyword: str = ""):
+        if not await self._check_admin_permission(event):
+            yield event.plain_result("权限不足：删除图库图片仅限群管理员、群主或 Bot 管理员。")
+            return
+        text = await self.quote_service.delete_gallery_image(event, keyword)
+        yield event.plain_result(text)
+
     @filter.command("语录帮助")
     async def help_quote(self, event: AstrMessageEvent):
         help_text = (
@@ -158,6 +199,8 @@ class QuotesPlugin(Star):
             "- 语录列表 [页码]：按最新优先查看当前会话的语录。\n"
             "- 语录排名：按已收录语录数量排名，已绑定用户显示其 tag。\n"
             "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
+            "- 图库图片删除 关键词：回复机器人发送的图库图片后删除单张。\n"
+            "- 图库删除 关键词：管理员二次确认后删除整个图库。\n"
             "- 绑定 @某人 tag：发送纯文本 tag 时随机该用户的语录。\n"
             "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
             "- 语录缓存清理：清理当前会话的语录渲染缓存。\n"
@@ -560,6 +603,59 @@ class QuotesPlugin(Star):
         if not text or text.lower() in {"none", "null", "undefined"} or text == "0":
             return False
         return not text.isdigit() or len(text) >= 5
+
+    def _consume_dangerous_confirmation(
+        self,
+        event: AstrMessageEvent,
+        *,
+        action: str,
+        target: str,
+        ttl_seconds: float = 60.0,
+    ) -> bool:
+        now = time()
+        self._dangerous_confirmations = {
+            key: expires_at
+            for key, expires_at in self._dangerous_confirmations.items()
+            if expires_at >= now
+        }
+        key = (
+            self._session_key(event),
+            str(event.get_sender_id()),
+            str(action),
+            str(target),
+        )
+        expires_at = self._dangerous_confirmations.pop(key, 0.0)
+        if expires_at >= now:
+            return True
+        self._dangerous_confirmations[key] = now + max(1.0, float(ttl_seconds))
+        return False
+
+    async def _check_admin_permission(self, event: AstrMessageEvent) -> bool:
+        try:
+            is_bot_admin = bool(getattr(event, "is_admin", None) and event.is_admin())
+        except Exception:
+            is_bot_admin = False
+        if is_bot_admin:
+            return True
+
+        group_id = event.get_group_id()
+        if not group_id:
+            return False
+        try:
+            group = await (event.get_group() if hasattr(event, "get_group") else None)
+        except Exception as exc:
+            logger.info(f"查询群信息失败: {exc}")
+            group = None
+        if group is None:
+            return False
+
+        sender_id = str(event.get_sender_id())
+        owner_id = str(getattr(group, "group_owner", "") or "")
+        admin_ids = {str(item) for item in getattr(group, "group_admins", [])}
+        return bool(
+            (owner_id and sender_id == owner_id)
+            or sender_id in admin_ids
+        )
 
     async def _check_delete_permission(self, event: AstrMessageEvent) -> bool:
         level = str(self.config.get("delete_permission") or "管理员").strip().replace(" ", "")

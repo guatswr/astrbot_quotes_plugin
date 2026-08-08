@@ -775,7 +775,8 @@ class QuoteRepository:
         created_files: list[Path],
     ) -> ImageAsset:
         asset_id = random_id("img_")
-        file_name = f"{asset_id}.jpg"
+        extension = ".gif" if str(image.extension).lower() == ".gif" else ".jpg"
+        file_name = f"{asset_id}{extension}"
         abs_path = store.image_abs_path(file_name)
         abs_path.write_bytes(image.content)
         created_files.append(abs_path)

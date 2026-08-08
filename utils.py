@@ -227,12 +227,27 @@ def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[
     return f"{int(''.join(bits), 2):0{hash_size * hash_size // 4}x}", width, height
 
 
+def _is_animated_gif(content: bytes) -> bool:
+    if not content:
+        return False
+    try:
+        with Image.open(BytesIO(content)) as image:
+            return bool(
+                image.format == "GIF"
+                and getattr(image, "is_animated", False)
+                and int(getattr(image, "n_frames", 1) or 1) > 1
+            )
+    except Exception:
+        return False
+
+
 def prepare_image(content: bytes, *, source: str = "", content_type: str = "") -> PreparedImage:
-    normalized = compress_image_for_pool(content)
+    animated_gif = _is_animated_gif(content)
+    normalized = content if animated_gif else compress_image_for_pool(content)
     dhash, width, height = compute_dhash(normalized)
     return PreparedImage(
         content=normalized,
-        extension=".jpg",
+        extension=".gif" if animated_gif else ".jpg",
         sha256=sha256_bytes(normalized),
         source=source,
         dhash=dhash,
@@ -248,9 +263,11 @@ def compress_image_for_pool(
     max_bytes: int = IMAGE_POOL_MAX_BYTES,
     initial_quality: int = IMAGE_POOL_JPEG_QUALITY,
 ) -> bytes:
-    """Decode and compress an image into the canonical pool JPEG format."""
+    """Preserve animated GIFs; compress other images into the pool JPEG format."""
     if not content:
         raise ValueError("图片内容为空")
+    if _is_animated_gif(content):
+        return content
 
     with Image.open(BytesIO(content)) as source:
         if getattr(source, "is_animated", False):
@@ -294,10 +311,12 @@ def normalize_image_file_for_send(
     max_edge: int = IMAGE_POOL_MAX_EDGE,
     max_bytes: int = IMAGE_POOL_MAX_BYTES,
 ) -> bytes:
-    """Load a pool image, reusing canonical JPEG bytes or upgrading legacy data."""
+    """Load a pool image, preserving GIFs or upgrading legacy static images."""
     content = Path(path).read_bytes()
     if not content:
         raise ValueError("图片文件为空")
+    if _is_animated_gif(content):
+        return content
 
     try:
         with Image.open(BytesIO(content)) as source:

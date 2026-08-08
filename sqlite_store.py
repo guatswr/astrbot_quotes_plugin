@@ -811,6 +811,207 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         finally:
             connection.close()
 
+    async def delete_gallery(self, session_key: str, keyword: str) -> tuple[int, int]:
+        normalized_keyword = str(keyword or "").strip()
+        if not session_key or not normalized_keyword:
+            return 0, 0
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._delete_gallery_sync,
+                session_key,
+                normalized_keyword,
+            )
+
+    def _delete_gallery_sync(self, session_key: str, keyword: str) -> tuple[int, int]:
+        connection = self._connect()
+        files_to_remove: list[Path] = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT gallery_images.asset_id
+                FROM gallery_images
+                WHERE session_key = ? AND keyword = ?
+                """,
+                (session_key, keyword),
+            ).fetchall()
+            if not rows:
+                connection.rollback()
+                return 0, 0
+
+            asset_counts = Counter(str(row["asset_id"]) for row in rows)
+            for asset_id, count in asset_counts.items():
+                connection.execute(
+                    """
+                    UPDATE image_assets
+                    SET ref_count = MAX(0, ref_count - ?)
+                    WHERE session_key = ? AND asset_id = ?
+                    """,
+                    (count, session_key, asset_id),
+                )
+
+            connection.execute(
+                "DELETE FROM gallery_sent_records WHERE session_key = ? AND keyword = ?",
+                (session_key, keyword),
+            )
+            connection.execute(
+                "DELETE FROM gallery_images WHERE session_key = ? AND keyword = ?",
+                (session_key, keyword),
+            )
+            orphan_rows = connection.execute(
+                """
+                SELECT rel_path FROM image_assets
+                WHERE session_key = ? AND ref_count <= 0
+                """,
+                (session_key,),
+            ).fetchall()
+            files_to_remove = [self.root / str(row["rel_path"]) for row in orphan_rows]
+            connection.execute(
+                "DELETE FROM image_assets WHERE session_key = ? AND ref_count <= 0",
+                (session_key,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        removed_files = 0
+        for path in files_to_remove:
+            try:
+                path.unlink(missing_ok=True)
+                removed_files += 1
+            except OSError as exc:
+                logger.info(f"删除图库资源文件失败: path={path}, error={exc}")
+        return len(rows), removed_files
+
+    def gallery_image_count(self, session_key: str, keyword: str) -> int:
+        normalized_keyword = str(keyword or "").strip()
+        if not session_key or not normalized_keyword:
+            return 0
+        with self._connection() as connection:
+            return int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM gallery_images
+                    WHERE session_key = ? AND keyword = ?
+                    """,
+                    (session_key, normalized_keyword),
+                ).fetchone()[0]
+            )
+
+    async def delete_gallery_image(
+        self,
+        session_key: str,
+        keyword: str,
+        image: PreparedImage,
+    ) -> tuple[str, bool]:
+        normalized_keyword = str(keyword or "").strip()
+        if not session_key or not normalized_keyword or image is None:
+            return "invalid", False
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._delete_gallery_image_sync,
+                session_key,
+                normalized_keyword,
+                image,
+            )
+
+    def _delete_gallery_image_sync(
+        self,
+        session_key: str,
+        keyword: str,
+        image: PreparedImage,
+    ) -> tuple[str, bool]:
+        connection = self._connect()
+        file_to_remove: Path | None = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT image_assets.*
+                FROM gallery_images
+                JOIN image_assets USING (asset_id)
+                WHERE gallery_images.session_key = ?
+                  AND gallery_images.keyword = ?
+                """,
+                (session_key, keyword),
+            ).fetchall()
+            if not rows:
+                connection.rollback()
+                return "gallery_not_found", False
+
+            matched = next(
+                (
+                    row
+                    for row in rows
+                    if is_near_duplicate(
+                        image,
+                        str(row["sha256"]),
+                        str(row["dhash"]),
+                        int(row["width"]),
+                        int(row["height"]),
+                    )
+                ),
+                None,
+            )
+            if matched is None:
+                connection.rollback()
+                return "image_not_found", False
+
+            asset_id = str(matched["asset_id"])
+            connection.execute(
+                """
+                DELETE FROM gallery_sent_records
+                WHERE session_key = ? AND keyword = ? AND asset_id = ?
+                """,
+                (session_key, keyword, asset_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM gallery_images
+                WHERE session_key = ? AND keyword = ? AND asset_id = ?
+                """,
+                (session_key, keyword, asset_id),
+            )
+            connection.execute(
+                """
+                UPDATE image_assets
+                SET ref_count = MAX(0, ref_count - 1)
+                WHERE session_key = ? AND asset_id = ?
+                """,
+                (session_key, asset_id),
+            )
+            current = connection.execute(
+                """
+                SELECT rel_path, ref_count FROM image_assets
+                WHERE session_key = ? AND asset_id = ?
+                """,
+                (session_key, asset_id),
+            ).fetchone()
+            if current is not None and int(current["ref_count"]) <= 0:
+                file_to_remove = self.root / str(current["rel_path"])
+                connection.execute(
+                    "DELETE FROM image_assets WHERE session_key = ? AND asset_id = ?",
+                    (session_key, asset_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        removed_file = False
+        if file_to_remove is not None:
+            try:
+                file_to_remove.unlink(missing_ok=True)
+                removed_file = True
+            except OSError as exc:
+                logger.info(f"删除单张图库资源失败: path={file_to_remove}, error={exc}")
+        return "deleted", removed_file
+
     async def random_gallery_image(
         self,
         session_key: str,

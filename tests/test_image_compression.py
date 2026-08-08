@@ -43,6 +43,40 @@ class ImageCompressionTests(unittest.TestCase):
                 prepared.content,
             )
 
+    def test_animated_gif_is_preserved_byte_for_byte(self) -> None:
+        source = BytesIO()
+        first = Image.new("RGBA", (48, 32), (255, 0, 0, 255))
+        second = Image.new("RGBA", (48, 32), (0, 0, 255, 255))
+        first.save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=[second],
+            duration=[80, 120],
+            loop=0,
+            disposal=2,
+        )
+        original = source.getvalue()
+
+        prepared = prepare_image(
+            original,
+            source="renamed-image.bin",
+            content_type="application/octet-stream",
+        )
+
+        self.assertEqual(prepared.extension, ".gif")
+        self.assertEqual(prepared.content, original)
+        self.assertEqual(prepared.sha256, sha256_bytes(original))
+        with Image.open(BytesIO(prepared.content)) as animated:
+            self.assertEqual(animated.format, "GIF")
+            self.assertTrue(animated.is_animated)
+            self.assertEqual(animated.n_frames, 2)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "img_pool.gif"
+            path.write_bytes(original)
+            self.assertEqual(normalize_image_file_for_send(path), original)
+
 
 if __name__ == "__main__":
     unittest.main()
