@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -364,7 +365,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             (1, 0),
         )
 
-        selected = repository.random_gallery_image("123456", "今天想看看猫猫")
+        selected = await repository.random_gallery_image("123456", "今天想看看猫猫")
         self.assertIsNotNone(selected)
         keyword, asset = selected
         self.assertEqual(keyword, "猫猫")
@@ -372,8 +373,46 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.root / asset.rel_path).exists())
         self.assertEqual(asset.ref_count, 2)
         self.assertEqual(len(repository.find_assets("123456", [asset.asset_id])), 1)
-        self.assertIsNone(repository.random_gallery_image("123456", "没有命中"))
+        self.assertIsNone(await repository.random_gallery_image("123456", "没有命中"))
         self.assertEqual(repository.list_quotes("123456"), [])
+
+    async def test_gallery_random_avoids_recent_images(self) -> None:
+        repository = QuoteRepository(self.root)
+        prepared_images = []
+        for pattern_index in range(3):
+            source = BytesIO()
+            image = PillowImage.new("L", (48, 32))
+            for y in range(32):
+                for x in range(48):
+                    if pattern_index == 0:
+                        value = max(0, 255 - x * 5)
+                    elif pattern_index == 1:
+                        value = min(255, y * 8)
+                    else:
+                        value = 255 if (x + y) % 2 else 0
+                    image.putpixel((x, y), value)
+            image.save(source, format="PNG")
+            prepared_images.append(prepare_image(source.getvalue(), source="gallery.png"))
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "轮播", prepared_images),
+            (3, 0),
+        )
+
+        concurrent_selections = await asyncio.gather(
+            *[
+                repository.random_gallery_image("123456", "触发轮播")
+                for _ in range(3)
+            ]
+        )
+        self.assertTrue(all(selected is not None for selected in concurrent_selections))
+        selected_ids = [selected[1].asset_id for selected in concurrent_selections]
+        fourth = await repository.random_gallery_image("123456", "触发轮播")
+        self.assertIsNotNone(fourth)
+        selected_ids.append(fourth[1].asset_id)
+
+        self.assertEqual(len(set(selected_ids[:3])), 3)
+        self.assertEqual(selected_ids[3], selected_ids[0])
+        self.assertNotEqual(selected_ids[3], selected_ids[2])
 
     async def test_quote_rankings_use_bound_tag(self) -> None:
         repository = QuoteRepository(self.root)
@@ -402,7 +441,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             [("10001", "名言", 2), ("10002", "李四", 1)],
         )
 
-    async def test_upgrades_sqlite_schema_v1_to_v3(self) -> None:
+    async def test_upgrades_sqlite_schema_v1_to_v4(self) -> None:
         repository = QuoteRepository(self.root)
         legacy_quote = Quote(
             id="q_before_binding_schema",
@@ -424,6 +463,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         connection = sqlite3.connect(database_path)
         try:
             connection.execute("DROP TABLE quote_bindings")
+            connection.execute("DROP TABLE gallery_sent_records")
             connection.execute("DROP TABLE gallery_images")
             connection.execute("PRAGMA user_version = 1")
             connection.commit()
@@ -453,6 +493,48 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gallery_images'"
             ).fetchone()
             self.assertIsNotNone(gallery_table)
+            history_table = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'gallery_sent_records'"
+            ).fetchone()
+            self.assertIsNotNone(history_table)
+        finally:
+            connection.close()
+
+    async def test_upgrades_v3_gallery_without_data_loss(self) -> None:
+        repository = QuoteRepository(self.root)
+        source = BytesIO()
+        PillowImage.new("RGB", (48, 32), (30, 60, 90)).save(source, format="PNG")
+        prepared_image = prepare_image(source.getvalue(), source="legacy-gallery.png")
+        self.assertEqual(
+            await repository.add_gallery_images("123456", "旧图库", [prepared_image]),
+            (1, 0),
+        )
+
+        database_path = self.root / DATABASE_FILENAME
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("DROP TABLE gallery_sent_records")
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        finally:
+            connection.close()
+
+        upgraded = QuoteRepository(self.root)
+        selected = await upgraded.random_gallery_image("123456", "触发旧图库")
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[0], "旧图库")
+        self.assertTrue((self.root / selected[1].rel_path).exists())
+        connection = sqlite3.connect(database_path)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DATABASE_SCHEMA_VERSION,
+            )
+            history_count = connection.execute(
+                "SELECT COUNT(*) FROM gallery_sent_records"
+            ).fetchone()[0]
+            self.assertEqual(history_count, 1)
         finally:
             connection.close()
 

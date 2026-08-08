@@ -23,7 +23,9 @@ try:
         DATABASE_SCHEMA_VERSION,
         DUPLICATE_IMAGE_MESSAGE,
         DUPLICATE_QUOTE_MESSAGE,
+        GALLERY_RECENT_WINDOW,
         IMAGE_INDEX_FILENAME,
+        MAX_GALLERY_SENT_RECORDS,
         MAX_SENT_RECORDS,
         MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
@@ -49,7 +51,9 @@ except ImportError:  # pragma: no cover
         DATABASE_SCHEMA_VERSION,
         DUPLICATE_IMAGE_MESSAGE,
         DUPLICATE_QUOTE_MESSAGE,
+        GALLERY_RECENT_WINDOW,
         IMAGE_INDEX_FILENAME,
+        MAX_GALLERY_SENT_RECORDS,
         MAX_SENT_RECORDS,
         MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
@@ -242,6 +246,25 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 )
                 current_version = 3
                 connection.execute("PRAGMA user_version = 3")
+            if current_version < 4:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS gallery_sent_records (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_key TEXT NOT NULL,
+                        keyword TEXT NOT NULL,
+                        asset_id TEXT NOT NULL,
+                        sent_at REAL NOT NULL DEFAULT 0,
+                        FOREIGN KEY(asset_id) REFERENCES image_assets(asset_id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_gallery_sent_recent
+                    ON gallery_sent_records(session_key, keyword, id DESC);
+                    CREATE INDEX IF NOT EXISTS idx_gallery_sent_asset
+                    ON gallery_sent_records(asset_id);
+                    """
+                )
+                current_version = 4
+                connection.execute("PRAGMA user_version = 4")
             connection.commit()
 
     def session_keys(self) -> list[str]:
@@ -788,7 +811,21 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         finally:
             connection.close()
 
-    def random_gallery_image(
+    async def random_gallery_image(
+        self,
+        session_key: str,
+        message_text: str,
+    ) -> tuple[str, ImageAsset] | None:
+        if not session_key or not str(message_text or ""):
+            return None
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._random_gallery_image_sync,
+                session_key,
+                str(message_text),
+            )
+
+    def _random_gallery_image_sync(
         self,
         session_key: str,
         message_text: str,
@@ -796,7 +833,9 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         text = str(message_text or "")
         if not session_key or not text:
             return None
-        with self._connection() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             keywords = [
                 str(row["keyword"])
                 for row in connection.execute(
@@ -810,36 +849,112 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             ]
             keyword = next((item for item in keywords if item and item in text), "")
             if not keyword:
+                connection.rollback()
                 return None
 
-            threshold = _random_key()
+            total = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM gallery_images
+                    WHERE session_key = ? AND keyword = ?
+                    """,
+                    (session_key, keyword),
+                ).fetchone()[0]
+            )
+            if total <= 0:
+                connection.rollback()
+                return None
+
+            recent_limit = min(max(0, total - 1), GALLERY_RECENT_WINDOW)
+            recent_ids: list[str] = []
+            if recent_limit:
+                recent_ids = [
+                    str(row["asset_id"])
+                    for row in connection.execute(
+                        """
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM gallery_sent_records
+                        WHERE session_key = ? AND keyword = ?
+                        GROUP BY asset_id
+                        ORDER BY latest_id DESC
+                        LIMIT ?
+                        """,
+                        (session_key, keyword, recent_limit),
+                    ).fetchall()
+                ]
+
+            exclusion_sql = ""
+            candidate_values: list[Any] = [session_key, keyword]
+            if recent_ids:
+                placeholders = ",".join("?" for _ in recent_ids)
+                exclusion_sql = f" AND gallery_images.asset_id NOT IN ({placeholders})"
+                candidate_values.extend(recent_ids)
+
+            candidate_count = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM gallery_images
+                    WHERE session_key = ? AND keyword = ?{exclusion_sql}
+                    """,
+                    candidate_values,
+                ).fetchone()[0]
+            )
+            if candidate_count <= 0:
+                connection.rollback()
+                return None
+
+            offset = secrets.randbelow(candidate_count)
             row = connection.execute(
-                """
+                f"""
                 SELECT image_assets.*
                 FROM gallery_images
                 JOIN image_assets USING (asset_id)
                 WHERE gallery_images.session_key = ?
-                  AND gallery_images.keyword = ?
-                  AND gallery_images.random_key >= ?
+                  AND gallery_images.keyword = ?{exclusion_sql}
                 ORDER BY gallery_images.random_key
-                LIMIT 1
+                LIMIT 1 OFFSET ?
                 """,
-                (session_key, keyword, threshold),
+                (*candidate_values, offset),
             ).fetchone()
             if row is None:
-                row = connection.execute(
-                    """
-                    SELECT image_assets.*
-                    FROM gallery_images
-                    JOIN image_assets USING (asset_id)
-                    WHERE gallery_images.session_key = ?
-                      AND gallery_images.keyword = ?
-                    ORDER BY gallery_images.random_key
-                    LIMIT 1
-                    """,
-                    (session_key, keyword),
-                ).fetchone()
-        return (keyword, self._image_from_row(row)) if row is not None else None
+                connection.rollback()
+                return None
+
+            asset_id = str(row["asset_id"])
+            connection.execute(
+                """
+                INSERT INTO gallery_sent_records (
+                    session_key, keyword, asset_id, sent_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (session_key, keyword, asset_id, time()),
+            )
+            connection.execute(
+                """
+                DELETE FROM gallery_sent_records
+                WHERE session_key = ? AND keyword = ? AND id NOT IN (
+                    SELECT id FROM gallery_sent_records
+                    WHERE session_key = ? AND keyword = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                """,
+                (
+                    session_key,
+                    keyword,
+                    session_key,
+                    keyword,
+                    MAX_GALLERY_SENT_RECORDS,
+                ),
+            )
+            connection.commit()
+            return keyword, self._image_from_row(row)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _insert_media_asset(self, connection: sqlite3.Connection, session_key: str, asset: MediaAsset, *, ignore: bool = False) -> None:
         clause = "OR IGNORE " if ignore else ""

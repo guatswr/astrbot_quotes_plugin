@@ -744,8 +744,7 @@ class QuoteService:
         session_key: str,
         message_text: str,
     ) -> CommandResponse | None:
-        selected = await asyncio.to_thread(
-            self.repository.random_gallery_image,
+        selected = await self.repository.random_gallery_image(
             session_key,
             message_text,
         )
