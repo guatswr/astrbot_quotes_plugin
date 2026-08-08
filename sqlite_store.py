@@ -830,25 +830,21 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         session_key: str,
         message_text: str,
     ) -> tuple[str, ImageAsset] | None:
-        text = str(message_text or "")
+        text = str(message_text or "").strip()
         if not session_key or not text:
             return None
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            keywords = [
-                str(row["keyword"])
-                for row in connection.execute(
-                    """
-                    SELECT DISTINCT keyword FROM gallery_images
-                    WHERE session_key = ?
-                    ORDER BY LENGTH(keyword) DESC, keyword
-                    """,
-                    (session_key,),
-                ).fetchall()
-            ]
-            keyword = next((item for item in keywords if item and item in text), "")
-            if not keyword:
+            keyword = text
+            if connection.execute(
+                """
+                SELECT 1 FROM gallery_images
+                WHERE session_key = ? AND keyword = ?
+                LIMIT 1
+                """,
+                (session_key, keyword),
+            ).fetchone() is None:
                 connection.rollback()
                 return None
 

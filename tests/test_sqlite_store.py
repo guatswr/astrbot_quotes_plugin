@@ -346,7 +346,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             ("not_found", ""),
         )
 
-    async def test_gallery_reuses_assets_and_matches_longest_keyword(self) -> None:
+    async def test_gallery_reuses_assets_and_requires_exact_keyword(self) -> None:
         repository = QuoteRepository(self.root)
         source = BytesIO()
         PillowImage.new("RGB", (48, 32), (20, 40, 60)).save(source, format="PNG")
@@ -365,7 +365,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             (1, 0),
         )
 
-        selected = await repository.random_gallery_image("123456", "今天想看看猫猫")
+        selected = await repository.random_gallery_image("123456", "  猫猫  ")
         self.assertIsNotNone(selected)
         keyword, asset = selected
         self.assertEqual(keyword, "猫猫")
@@ -373,6 +373,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.root / asset.rel_path).exists())
         self.assertEqual(asset.ref_count, 2)
         self.assertEqual(len(repository.find_assets("123456", [asset.asset_id])), 1)
+        self.assertIsNone(await repository.random_gallery_image("123456", "今天想看看猫猫"))
         self.assertIsNone(await repository.random_gallery_image("123456", "没有命中"))
         self.assertEqual(repository.list_quotes("123456"), [])
 
@@ -400,13 +401,13 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
 
         concurrent_selections = await asyncio.gather(
             *[
-                repository.random_gallery_image("123456", "触发轮播")
+                repository.random_gallery_image("123456", "轮播")
                 for _ in range(3)
             ]
         )
         self.assertTrue(all(selected is not None for selected in concurrent_selections))
         selected_ids = [selected[1].asset_id for selected in concurrent_selections]
-        fourth = await repository.random_gallery_image("123456", "触发轮播")
+        fourth = await repository.random_gallery_image("123456", "轮播")
         self.assertIsNotNone(fourth)
         selected_ids.append(fourth[1].asset_id)
 
@@ -521,7 +522,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             connection.close()
 
         upgraded = QuoteRepository(self.root)
-        selected = await upgraded.random_gallery_image("123456", "触发旧图库")
+        selected = await upgraded.random_gallery_image("123456", "旧图库")
         self.assertIsNotNone(selected)
         self.assertEqual(selected[0], "旧图库")
         self.assertTrue((self.root / selected[1].rel_path).exists())

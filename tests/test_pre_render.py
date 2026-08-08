@@ -301,12 +301,18 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
 
                 gallery_response = await service.random_gallery_response(
                     "123456",
-                    "今天来杯曼彻斯特咖啡",
+                    "曼彻斯特咖啡",
                 )
                 self.assertIsNotNone(gallery_response)
                 self.assertEqual(gallery_response.kind, "chain")
                 self.assertEqual(len(gallery_response.chain), 1)
                 self.assertTrue(gallery_response.chain[0].file.startswith("base64://"))
+                self.assertIsNone(
+                    await service.random_gallery_response(
+                        "123456",
+                        "今天来杯曼彻斯特咖啡",
+                    )
+                )
                 self.assertIsNone(
                     await service.random_gallery_response("123456", "没有关键词")
                 )
