@@ -14,20 +14,32 @@ except Exception:  # pragma: no cover
     AstrBotConfig = dict  # type: ignore
 
 try:
-    from .constants import PLUGIN_NAME
+    from .constants import (
+        PLUGIN_NAME,
+        QUOTE_EVENT_LIMIT,
+        QUOTE_EVENT_WINDOW_SECONDS,
+        QUOTE_RATE_LIMIT_MESSAGES,
+    )
     from .image_service import ImageService
     from .models import CommandResponse
     from .napcat_service import NapcatService
     from .quote_service import QuoteService
+    from .rate_limiter import SlidingWindowRateLimiter
     from .renderer import QuoteRenderer
     from .sqlite_store import QuoteRepository
     from .utils import ensure_plugin_data_dir, is_valid_qq, make_session_key, resolve_wake_prefixes
 except ImportError:  # pragma: no cover
-    from constants import PLUGIN_NAME
+    from constants import (
+        PLUGIN_NAME,
+        QUOTE_EVENT_LIMIT,
+        QUOTE_EVENT_WINDOW_SECONDS,
+        QUOTE_RATE_LIMIT_MESSAGES,
+    )
     from image_service import ImageService
     from models import CommandResponse
     from napcat_service import NapcatService
     from quote_service import QuoteService
+    from rate_limiter import SlidingWindowRateLimiter
     from renderer import QuoteRenderer
     from sqlite_store import QuoteRepository
     from utils import ensure_plugin_data_dir, is_valid_qq, make_session_key, resolve_wake_prefixes
@@ -75,6 +87,10 @@ class QuotesPlugin(Star):
         self._cfg_poke_group_whitelist = self._parse_id_set(self.config.get("poke_group_whitelist") or [])
         self._cfg_poke_group_blacklist = self._parse_id_set(self.config.get("poke_group_blacklist") or [])
         self._dangerous_confirmations: dict[tuple[str, str, str, str], float] = {}
+        self._quote_event_limiter = SlidingWindowRateLimiter(
+            limit=QUOTE_EVENT_LIMIT,
+            window_seconds=QUOTE_EVENT_WINDOW_SECONDS,
+        )
 
     async def initialize(self):
         await self.repository.migrate_legacy_data()
@@ -97,6 +113,15 @@ class QuotesPlugin(Star):
 
     @filter.command("语录")
     async def random_quote(self, event: AstrMessageEvent, uid: str = ""):
+        target = self.quote_service.extract_at_qq(event) or str(uid or "").strip()
+        allowed, limited_response = self._check_quote_event_rate_limit(
+            event,
+            target=target or "语录里的某个人",
+        )
+        if not allowed:
+            for item in self._emit_response(event, limited_response):
+                yield item
+            return
         response = await self.quote_service.random_quote(event, uid=uid, silent_if_empty=False)
         for item in self._emit_response(event, response):
             yield item
@@ -203,6 +228,7 @@ class QuotesPlugin(Star):
             "- 图库删除 关键词：管理员二次确认后删除整个图库。\n"
             "- 绑定 @某人 tag：发送纯文本 tag 时随机该用户的语录。\n"
             "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
+            "- 频率限制：每人在当前会话 2 分钟内最多触发 4 次语录或图库。\n"
             "- 语录缓存清理：清理当前会话的语录渲染缓存。\n"
             "- 语录帮助：查看本帮助。"
         )
@@ -287,6 +313,14 @@ class QuotesPlugin(Star):
         binding = self.repository.get_binding_by_tag(self._session_key(event), tag)
         if binding is None:
             return
+        allowed, limited_response = self._check_quote_event_rate_limit(
+            event,
+            target=binding.tag,
+        )
+        if not allowed:
+            for item in self._emit_response(event, limited_response):
+                yield item
+            return
         response = await self.quote_service.random_quote(
             event,
             uid=binding.qq,
@@ -312,6 +346,16 @@ class QuotesPlugin(Star):
 
         session_key = self._session_key(event)
         if self.repository.get_binding_by_tag(session_key, message_text) is not None:
+            return
+        if self.repository.gallery_image_count(session_key, message_text) <= 0:
+            return
+        allowed, limited_response = self._check_quote_event_rate_limit(
+            event,
+            target=f'“{message_text}”图库',
+        )
+        if not allowed:
+            for item in self._emit_response(event, limited_response):
+                yield item
             return
         response = await self.quote_service.random_gallery_response(
             session_key,
@@ -344,6 +388,15 @@ class QuotesPlugin(Star):
         if self._cfg_poke_probability < 100 and secrets.randbelow(100) >= self._cfg_poke_probability:
             return
 
+        allowed, limited_response = self._check_quote_event_rate_limit(
+            event,
+            target="亚托莉",
+        )
+        if not allowed:
+            for item in self._emit_response(event, limited_response):
+                yield item
+            return
+
         response = await self.quote_service.random_quote(event, uid="", silent_if_empty=True)
         for item in self._emit_response(event, response):
             yield item
@@ -364,6 +417,38 @@ class QuotesPlugin(Star):
                 logger.info(f"已记录语录发送索引: quote_id={quote_id}, session={self._session_key(event)}")
         except Exception as exc:
             logger.info(f"after_message_sent 记录失败: {exc}")
+
+    def _check_quote_event_rate_limit(
+        self,
+        event: AstrMessageEvent,
+        *,
+        target: str,
+    ) -> tuple[bool, CommandResponse | None]:
+        sender_id = str(event.get_sender_id())
+        decision = self._quote_event_limiter.check(
+            (self._session_key(event), sender_id)
+        )
+        if decision.allowed:
+            return True, None
+        if not decision.notify:
+            return False, None
+
+        import secrets
+
+        display_target = str(target or "语录里的某个人").strip()
+        template = secrets.choice(QUOTE_RATE_LIMIT_MESSAGES)
+        warning = template.format(
+            target=display_target,
+            seconds=decision.retry_after,
+        )
+        try:
+            response = CommandResponse(
+                kind="chain",
+                chain=[Comp.At(qq=sender_id), Comp.Plain(f" {warning}")],
+            )
+        except Exception:
+            response = CommandResponse(kind="plain", text=f"@{sender_id} {warning}")
+        return False, response
 
     def _emit_response(self, event: AstrMessageEvent, response: CommandResponse | None):
         if response is None or response.kind == "none":

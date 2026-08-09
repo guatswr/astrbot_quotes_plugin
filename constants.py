@@ -9,6 +9,16 @@ DUPLICATE_QUOTE_MESSAGE = "语录内容已存在"
 UPLOAD_SUCCESS_PROMPT = "我学会啦，来问问我吧！高性能ですから~"
 GALLERY_RECENT_WINDOW = 20
 MAX_GALLERY_SENT_RECORDS = 200
+QUOTE_EVENT_LIMIT = 4
+QUOTE_EVENT_WINDOW_SECONDS = 120
+QUOTE_RATE_LIMIT_MESSAGES = (
+    "你是不是暗恋{target}？{seconds} 秒后再试吧。",
+    "对{target}这么上心吗？先冷静 {seconds} 秒吧。",
+    "语录也需要喘口气，{seconds} 秒后再来找{target}吧。",
+    "高性能也顶不住这样连点呀，{seconds} 秒后再试。",
+    "{target}都要被你念害羞啦，休息 {seconds} 秒吧。",
+    "检测到对{target}的热烈关注，冷却还剩 {seconds} 秒。",
+)
 GROUPS_DIRNAME = "groups"
 IMAGES_DIRNAME = "images"
 MEDIA_DIRNAME = "media"
