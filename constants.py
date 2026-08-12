@@ -10,7 +10,7 @@ UPLOAD_SUCCESS_PROMPT = "我学会啦，来问问我吧！高性能ですから~
 GALLERY_RECENT_WINDOW = 20
 MAX_GALLERY_SENT_RECORDS = 200
 QUOTE_EVENT_LIMIT = 4
-QUOTE_EVENT_WINDOW_SECONDS = 120
+QUOTE_EVENT_WINDOW_SECONDS = 600
 QUOTE_RATE_LIMIT_MESSAGES = (
     "你是不是暗恋{target}？{seconds} 秒后再试吧。",
     "对{target}这么上心吗？先冷静 {seconds} 秒吧。",
