@@ -34,6 +34,20 @@ class GitBackupResult:
     committed: bool = False
     pushed: bool = False
 
+    @property
+    def command_message(self) -> str:
+        if self.status == "pushed":
+            if self.committed:
+                return "语录备份完成：已提交并推送数据变更。"
+            return "语录备份完成：已推送此前未同步的提交。"
+        if self.status == "unchanged":
+            return "语录备份完成：数据目录没有需要备份的变更。"
+        if self.status == "disabled":
+            return "语录备份未执行：请先在插件配置中启用 Git 自动备份。"
+        if self.status == "error":
+            return f"语录备份失败：{self.message}"
+        return self.message
+
 
 StageGuardFactory = Callable[[], AsyncContextManager[None]]
 

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from git_backup import GitBackupService, GitCommandResult
+from git_backup import GitBackupResult, GitBackupService, GitCommandResult
 
 
 class GitBackupServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -19,6 +19,28 @@ class GitBackupServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def _service(self, **kwargs: object) -> GitBackupService:
         return GitBackupService(self.root, enabled=True, **kwargs)
+
+    def test_command_messages_distinguish_backup_outcomes(self) -> None:
+        self.assertIn(
+            "已提交并推送",
+            GitBackupResult("pushed", "", committed=True, pushed=True).command_message,
+        )
+        self.assertIn(
+            "此前未同步",
+            GitBackupResult("pushed", "", pushed=True).command_message,
+        )
+        self.assertIn(
+            "没有需要备份",
+            GitBackupResult("unchanged", "").command_message,
+        )
+        self.assertIn(
+            "请先在插件配置中启用",
+            GitBackupResult("disabled", "").command_message,
+        )
+        self.assertEqual(
+            GitBackupResult("error", "remote rejected").command_message,
+            "语录备份失败：remote rejected",
+        )
 
     async def test_disabled_backup_does_not_invoke_git(self) -> None:
         service = GitBackupService(self.root, enabled=False)

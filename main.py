@@ -178,6 +178,16 @@ class QuotesPlugin(Star):
         text = await self.quote_service.build_storage_audit_text(self._session_key(event))
         yield event.plain_result(text)
 
+    @filter.command("语录备份")
+    async def backup_quote_data(self, event: AstrMessageEvent):
+        if not self._is_bot_admin(event):
+            yield event.plain_result("权限不足：手动语录备份仅限 Bot 管理员使用。")
+            return
+        result = await self.git_backup.backup_once()
+        if result.status == "error":
+            logger.warning(f"手动 Git 备份失败: {result.message}")
+        yield event.plain_result(result.command_message)
+
     @filter.command("语录缓存清理")
     async def clear_quote_cache(self, event: AstrMessageEvent):
         removed, failed = await self.quote_service.clear_render_cache(self._session_key(event))
@@ -271,6 +281,7 @@ class QuotesPlugin(Star):
             "- 频率限制：每人在当前会话 2 分钟内最多触发 4 次语录或图库。\n"
             "- 语录缓存清理：清理当前会话的语录渲染缓存。\n"
             "- 语录存储检查：只读检查资源引用、缺失文件和孤儿文件。\n"
+            "- 语录备份：Bot 管理员立即执行一次 Git 数据备份。\n"
             "- 语录帮助：查看本帮助。"
         )
         yield event.plain_result(help_text)
@@ -778,11 +789,7 @@ class QuotesPlugin(Star):
         return False
 
     async def _check_admin_permission(self, event: AstrMessageEvent) -> bool:
-        try:
-            is_bot_admin = bool(getattr(event, "is_admin", None) and event.is_admin())
-        except Exception:
-            is_bot_admin = False
-        if is_bot_admin:
+        if self._is_bot_admin(event):
             return True
 
         group_id = event.get_group_id()
@@ -804,15 +811,18 @@ class QuotesPlugin(Star):
             or sender_id in admin_ids
         )
 
+    def _is_bot_admin(self, event: AstrMessageEvent) -> bool:
+        try:
+            return bool(getattr(event, "is_admin", None) and event.is_admin())
+        except Exception:
+            return False
+
     async def _check_delete_permission(self, event: AstrMessageEvent) -> bool:
         level = str(self.config.get("delete_permission") or "管理员").strip().replace(" ", "")
         if level in {"群员", "member", "普通成员"}:
             return True
 
-        try:
-            is_bot_admin = bool(getattr(event, "is_admin", None) and event.is_admin())
-        except Exception:
-            is_bot_admin = False
+        is_bot_admin = self._is_bot_admin(event)
 
         if level in {"Bot管理员", "bot管理员", "BOT管理员", "bot_admin", "BotAdmin"}:
             return is_bot_admin
