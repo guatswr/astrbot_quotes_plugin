@@ -109,6 +109,125 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             ["q_page_06", "q_page_05", "q_page_04", "q_page_03", "q_page_02"],
         )
 
+    async def test_random_quote_strictly_avoids_consecutive_repeats(self) -> None:
+        repository = QuoteRepository(self.root)
+        for index in range(3):
+            quote = Quote(
+                id=f"q_random_{index}",
+                qq="10001",
+                name="测试用户",
+                text=f"随机语录 {index}",
+                created_by="20002",
+                created_at=float(index),
+                group="123456",
+                content_fingerprint=f"random-fingerprint-{index}",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+
+        selected_ids = []
+        for _ in range(30):
+            selected = await repository.random_quote(
+                "123456",
+                history_session_key="123456",
+            )
+            self.assertIsNotNone(selected)
+            selected_ids.append(selected.id)
+
+        self.assertTrue(
+            all(previous != current for previous, current in zip(selected_ids, selected_ids[1:]))
+        )
+
+    async def test_random_quote_state_persists_and_is_shared_across_filters(self) -> None:
+        repository = QuoteRepository(self.root)
+        for quote_id, qq in (("q_owner_1", "10001"), ("q_owner_2", "10002")):
+            quote = Quote(
+                id=quote_id,
+                qq=qq,
+                name=qq,
+                text=quote_id,
+                created_by="20002",
+                created_at=1.0,
+                group="123456",
+                content_fingerprint=f"fingerprint-{quote_id}",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+
+        only_owner = await repository.random_quote(
+            "123456",
+            qq="10001",
+            history_session_key="123456",
+        )
+        self.assertEqual(only_owner.id, "q_owner_1")
+
+        restarted = QuoteRepository(self.root)
+        unfiltered = await restarted.random_quote(
+            "123456",
+            history_session_key="123456",
+        )
+        self.assertEqual(unfiltered.id, "q_owner_2")
+
+        single_candidate = await restarted.random_quote(
+            "123456",
+            qq="10002",
+            history_session_key="123456",
+        )
+        self.assertEqual(single_candidate.id, "q_owner_2")
+
+    async def test_concurrent_random_quotes_do_not_repeat(self) -> None:
+        repository = QuoteRepository(self.root)
+        for index in range(2):
+            quote = Quote(
+                id=f"q_concurrent_{index}",
+                qq="10001",
+                name="测试用户",
+                text=f"并发语录 {index}",
+                created_by="20002",
+                created_at=float(index),
+                group="123456",
+                content_fingerprint=f"concurrent-fingerprint-{index}",
+            )
+            await repository.create_quote_with_segments(
+                "123456",
+                quote,
+                [PendingQuoteSegment(type="text", text=quote.text)],
+            )
+
+        selected = await asyncio.gather(
+            *[
+                repository.random_quote(
+                    "123456",
+                    history_session_key="123456",
+                )
+                for _ in range(20)
+            ]
+        )
+        selected_ids = [quote.id for quote in selected]
+        self.assertTrue(
+            all(previous != current for previous, current in zip(selected_ids, selected_ids[1:]))
+        )
+
+        second_repository = QuoteRepository(self.root)
+        for index in range(10):
+            first, second = await asyncio.gather(
+                repository.random_quote(
+                    "123456",
+                    history_session_key=f"concurrent-session-{index}",
+                ),
+                second_repository.random_quote(
+                    "123456",
+                    history_session_key=f"concurrent-session-{index}",
+                ),
+            )
+            self.assertNotEqual(first.id, second.id)
+
     async def test_migrates_session_json_and_keeps_backup(self) -> None:
         session_dir = self.root / "groups" / "778899"
         session_dir.mkdir(parents=True)
@@ -558,7 +677,7 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             [("10001", "名言", 2), ("10002", "李四", 1)],
         )
 
-    async def test_upgrades_sqlite_schema_v1_to_v4(self) -> None:
+    async def test_upgrades_sqlite_schema_v1_to_v5(self) -> None:
         repository = QuoteRepository(self.root)
         legacy_quote = Quote(
             id="q_before_binding_schema",
@@ -615,6 +734,11 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
                 "WHERE type = 'table' AND name = 'gallery_sent_records'"
             ).fetchone()
             self.assertIsNotNone(history_table)
+            random_state_table = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'quote_random_state'"
+            ).fetchone()
+            self.assertIsNotNone(random_state_table)
         finally:
             connection.close()
 

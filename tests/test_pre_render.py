@@ -180,9 +180,55 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
                 response.chain[0].file,
                 "https://q1.qlogo.cn/g?b=qq&nk=10001&s=100",
             )
-            self.assertEqual(response.chain[1].text, "「纯文字语录」 — 名言")
+            self.assertEqual(
+                response.chain[1].text,
+                "\n❝  纯文字语录  ❞\n\n—— 名言",
+            )
         finally:
             quote_service_module.Comp = original_components
+
+    def test_plain_quote_literary_style_and_delete_compatibility(self) -> None:
+        service = object.__new__(QuoteService)
+        long_text = "这是一条需要使用多行引用排版的长语录，" * 4
+        quote = Quote(
+            id="q_long_text",
+            qq="10001",
+            name="原昵称",
+            text=long_text,
+            created_by="20002",
+            created_at=1.0,
+            group="123456",
+        )
+
+        styled = service._quote_plain_fallback(quote, "长篇名言")
+        self.assertEqual(
+            styled,
+            f"❝  {long_text}  ❞\n\n—— 长篇名言",
+        )
+        self.assertTrue(
+            service._is_avatar_text_quote(
+                [
+                    SimpleNamespace(type="image"),
+                    SimpleNamespace(type="text", text=styled),
+                ]
+            )
+        )
+        self.assertTrue(
+            service._is_avatar_text_quote(
+                [
+                    SimpleNamespace(type="image"),
+                    SimpleNamespace(type="text", text="「旧版语录」 — 旧署名"),
+                ]
+            )
+        )
+        self.assertTrue(
+            service._is_avatar_text_quote(
+                [
+                    SimpleNamespace(type="image"),
+                    SimpleNamespace(type="text", text="❝  文学版语录  ❞\n\n—— 旧署名"),
+                ]
+            )
+        )
 
     async def test_image_quote_chain_appends_bound_sender_id(self) -> None:
         original_components = quote_service_module.Comp
@@ -628,7 +674,10 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
 
             response = await service.random_quote(FakeEvent())
             self.assertEqual(response.kind, "plain")
-            self.assertEqual(response.text, "「绑定签名测试」 — 名言")
+            self.assertEqual(
+                response.text,
+                "❝  绑定签名测试  ❞\n\n—— 名言",
+            )
             renderer.release.set()
             await asyncio.gather(*list(service._render_tasks))
             tag_cache = repository.get_store("123456").cache_path("q_bound_random", "名言")

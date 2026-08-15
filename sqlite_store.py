@@ -265,6 +265,21 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 )
                 current_version = 4
                 connection.execute("PRAGMA user_version = 4")
+            if current_version < 5:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS quote_random_state (
+                        session_key TEXT PRIMARY KEY,
+                        quote_id TEXT NOT NULL,
+                        selected_at REAL NOT NULL DEFAULT 0,
+                        FOREIGN KEY(quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_quote_random_state_quote
+                    ON quote_random_state(quote_id);
+                    """
+                )
+                current_version = 5
+                connection.execute("PRAGMA user_version = 5")
             connection.commit()
 
     def session_keys(self) -> list[str]:
@@ -352,6 +367,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
     def _create_binding_sync(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
         connection = self._connect()
         try:
+            # Serialize selection and state replacement across repository instances.
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT * FROM quote_bindings WHERE session_key = ? AND qq = ?",
@@ -1330,10 +1346,28 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         finally:
             connection.close()
 
-    async def random_quote(self, session_key: str | None = None, qq: str | None = None) -> Quote | None:
-        return await asyncio.to_thread(self._random_quote_sync, session_key, qq)
+    async def random_quote(
+        self,
+        session_key: str | None = None,
+        qq: str | None = None,
+        *,
+        history_session_key: str | None = None,
+    ) -> Quote | None:
+        history_key = history_session_key or session_key or "__global__"
+        async with self._db_write_lock:
+            return await asyncio.to_thread(
+                self._random_quote_sync,
+                session_key,
+                qq,
+                history_key,
+            )
 
-    def _random_quote_sync(self, session_key: str | None, qq: str | None) -> Quote | None:
+    def _random_quote_sync(
+        self,
+        session_key: str | None,
+        qq: str | None,
+        history_session_key: str,
+    ) -> Quote | None:
         conditions: list[str] = []
         values: list[Any] = []
         if session_key is not None:
@@ -1343,20 +1377,73 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             conditions.append("qq = ?")
             values.append(str(qq))
         base_where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        threshold = _random_key()
-        threshold_where = f"{base_where}{' AND' if base_where else ' WHERE'} random_key >= ?"
 
-        with self._connection() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute(
+                "SELECT quote_id FROM quote_random_state WHERE session_key = ?",
+                (history_session_key,),
+            ).fetchone()
+            last_quote_id = str(state["quote_id"]) if state is not None else ""
+
+            candidate_where = base_where
+            candidate_values = list(values)
+            if last_quote_id:
+                candidate_where = (
+                    f"{base_where}{' AND' if base_where else ' WHERE'} id <> ?"
+                )
+                candidate_values.append(last_quote_id)
+
+            candidate_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM quotes{candidate_where}",
+                    candidate_values,
+                ).fetchone()[0]
+            )
+            if candidate_count == 0 and last_quote_id:
+                candidate_where = base_where
+                candidate_values = list(values)
+                candidate_count = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM quotes{candidate_where}",
+                        candidate_values,
+                    ).fetchone()[0]
+                )
+            if candidate_count == 0:
+                connection.rollback()
+                return None
+
+            offset = secrets.randbelow(candidate_count)
             row = connection.execute(
-                f"SELECT * FROM quotes{threshold_where} ORDER BY random_key LIMIT 1",
-                (*values, threshold),
+                f"""
+                SELECT * FROM quotes{candidate_where}
+                ORDER BY random_key, id
+                LIMIT 1 OFFSET ?
+                """,
+                (*candidate_values, offset),
             ).fetchone()
             if row is None:
-                row = connection.execute(
-                    f"SELECT * FROM quotes{base_where} ORDER BY random_key LIMIT 1",
-                    values,
-                ).fetchone()
-        return self._row_to_quote(row) if row is not None else None
+                connection.rollback()
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO quote_random_state (session_key, quote_id, selected_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    quote_id = excluded.quote_id,
+                    selected_at = excluded.selected_at
+                """,
+                (history_session_key, str(row["id"]), time()),
+            )
+            connection.commit()
+            return self._row_to_quote(row)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     async def record_sent_quote(
         self,

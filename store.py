@@ -244,6 +244,8 @@ class QuoteRepository:
         self.groups_dir.mkdir(parents=True, exist_ok=True)
         self._stores: dict[str, SessionStore] = {}
         self._migration_lock = asyncio.Lock()
+        self._random_quote_lock = asyncio.Lock()
+        self._last_random_quote_ids: dict[str, str] = {}
 
     def get_store(self, session_key: str) -> SessionStore:
         if session_key not in self._stores:
@@ -482,23 +484,36 @@ class QuoteRepository:
 
         return CreateQuoteResult(quote=quote)
 
-    async def random_quote(self, session_key: str | None = None, qq: str | None = None) -> Quote | None:
+    async def random_quote(
+        self,
+        session_key: str | None = None,
+        qq: str | None = None,
+        *,
+        history_session_key: str | None = None,
+    ) -> Quote | None:
         import secrets
 
-        candidates: list[Quote] = []
-        if session_key is None:
-            session_keys = self.session_keys()
-        else:
-            session_keys = [session_key]
+        history_key = history_session_key or session_key or "__global__"
+        async with self._random_quote_lock:
+            candidates: list[Quote] = []
+            if session_key is None:
+                session_keys = self.session_keys()
+            else:
+                session_keys = [session_key]
 
-        for key in session_keys:
-            for quote in self.get_store(key).load_quotes():
-                if qq and str(quote.qq) != str(qq):
-                    continue
-                candidates.append(quote)
-        if not candidates:
-            return None
-        return secrets.choice(candidates)
+            for key in session_keys:
+                for quote in self.get_store(key).load_quotes():
+                    if qq and str(quote.qq) != str(qq):
+                        continue
+                    candidates.append(quote)
+            if not candidates:
+                return None
+
+            last_quote_id = self._last_random_quote_ids.get(history_key, "")
+            alternatives = [quote for quote in candidates if quote.id != last_quote_id]
+            selected = secrets.choice(alternatives or candidates)
+            self._last_random_quote_ids[history_key] = selected.id
+            return selected
 
     async def delete_quote(self, quote_id: str) -> bool:
         for session_key in self.session_keys():

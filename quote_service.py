@@ -337,7 +337,11 @@ class QuoteService:
         target_session = None if self.global_mode else session_key
         explicit_qq = uid.strip() if is_valid_qq(uid) else ""
         only_qq = explicit_qq or (self.extract_at_qq(event) or "")
-        quote = await self.repository.random_quote(target_session, qq=only_qq or None)
+        quote = await self.repository.random_quote(
+            target_session,
+            qq=only_qq or None,
+            history_session_key=session_key,
+        )
         if quote is None:
             if not silent_if_empty:
                 logger.info(
@@ -1246,7 +1250,9 @@ class QuoteService:
     def _quote_plain_fallback(self, quote: Quote, signature: str = "") -> str:
         if quote.kind == "forward":
             return quote.text or f"{quote.name} 的聊天记录语录"
-        return f"「{quote.text}」 — {signature or quote.name}"
+        body = normalize_quote_text(str(quote.text or "")) or "……"
+        author = " ".join(str(signature or quote.name or quote.qq or "未知用户").split())
+        return f"❝  {body}  ❞\n\n—— {author}"
 
     def _plain_quote_response(self, quote: Quote, signature: str = "") -> CommandResponse:
         text = self._quote_plain_fallback(quote, signature)
@@ -1258,7 +1264,7 @@ class QuoteService:
                     chain.append(Comp.Image.fromURL(self._quote_avatar_url(qq)))
                 except Exception as exc:
                     logger.info(f"构造语录头像组件失败，回退纯文本: qq={qq}, error={exc}")
-            chain.append(Comp.Plain(text))
+            chain.append(Comp.Plain(f"\n{text}" if chain else text))
         if chain:
             return CommandResponse(
                 kind="chain",
@@ -1354,7 +1360,10 @@ class QuoteService:
         if image_segment.type != "image" or text_segment.type != "text":
             return False
         text = normalize_quote_text(str(text_segment.text or ""))
-        return text.startswith("「") and "」 — " in text
+        legacy_style = text.startswith("「") and "」 — " in text
+        literary_style = text.startswith("❝") and "❞" in text and "—— " in text
+        ascii_style = text.startswith("+--[ QUOTE ]") and "| +--[ " in text and text.endswith("]")
+        return legacy_style or literary_style or ascii_style
 
     def _fingerprint_plain_text(self, text: str) -> str:
         normalized = self._canonical_text(normalize_quote_text(text))
