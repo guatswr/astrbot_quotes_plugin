@@ -5,7 +5,7 @@ import json
 import secrets
 import sqlite3
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from time import time
 from typing import Any, Iterable
@@ -118,6 +118,19 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             yield connection
         finally:
             connection.close()
+
+    @asynccontextmanager
+    async def git_backup_snapshot(self):
+        """Pause repository writes and checkpoint WAL while Git stages the data tree."""
+        async with self._db_write_lock:
+            await asyncio.to_thread(self._checkpoint_database_sync)
+            yield
+
+    def _checkpoint_database_sync(self) -> None:
+        with self._connection() as connection:
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0]) != 0:
+            raise RuntimeError("SQLite WAL checkpoint 未完成，稍后重试备份。")
 
     def _initialize_database(self) -> None:
         with self._connection() as connection:

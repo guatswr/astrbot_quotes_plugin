@@ -20,6 +20,7 @@ try:
         QUOTE_EVENT_WINDOW_SECONDS,
         QUOTE_RATE_LIMIT_MESSAGES,
     )
+    from .git_backup import DEFAULT_GIT_BACKUP_MESSAGE, GitBackupService
     from .image_service import ImageService
     from .models import CommandResponse
     from .napcat_service import NapcatService
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover
         QUOTE_EVENT_WINDOW_SECONDS,
         QUOTE_RATE_LIMIT_MESSAGES,
     )
+    from git_backup import DEFAULT_GIT_BACKUP_MESSAGE, GitBackupService
     from image_service import ImageService
     from models import CommandResponse
     from napcat_service import NapcatService
@@ -59,6 +61,28 @@ class QuotesPlugin(Star):
         self.http_client = self._create_http_client()
         self.data_root = ensure_plugin_data_dir(str(self.config.get("storage") or "").strip(), PLUGIN_NAME)
         self.repository = QuoteRepository(self.data_root)
+        git_backup_config = self.config.get("git_backup") or {}
+        self.git_backup = GitBackupService(
+            self.data_root,
+            enabled=bool(git_backup_config.get("enabled", False)),
+            interval_seconds=self._parse_bounded_float(
+                git_backup_config.get("interval_minutes", 1440),
+                default=1440.0,
+                minimum=1.0,
+                maximum=525600.0,
+            )
+            * 60.0,
+            commit_message=str(
+                git_backup_config.get("commit_message") or DEFAULT_GIT_BACKUP_MESSAGE
+            ),
+            command_timeout_seconds=self._parse_bounded_float(
+                git_backup_config.get("command_timeout_seconds", 120),
+                default=120.0,
+                minimum=10.0,
+                maximum=1800.0,
+            ),
+            stage_guard_factory=self.repository.git_backup_snapshot,
+        )
         self.napcat_service = NapcatService()
         self._wake_prefixes = resolve_wake_prefixes(self._resolve_context_config())
         self.image_service = ImageService(
@@ -96,8 +120,10 @@ class QuotesPlugin(Star):
         await self.repository.migrate_legacy_data()
         await self.renderer.warmup()
         self.quote_service.schedule_startup_pre_render()
+        self.git_backup.start()
 
     async def terminate(self):
+        await self.git_backup.stop()
         await self.quote_service.shutdown()
         if self.http_client is not None:
             try:
@@ -584,6 +610,19 @@ class QuotesPlugin(Star):
             return max(0.0, min(5.0, float(value)))
         except (TypeError, ValueError):
             return 0.8
+
+    def _parse_bounded_float(
+        self,
+        value: Any,
+        *,
+        default: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        try:
+            return max(minimum, min(maximum, float(value)))
+        except (TypeError, ValueError):
+            return default
 
     def _parse_id_set(self, values: Any) -> set[str]:
         return {str(item).strip() for item in values if str(item).strip()}

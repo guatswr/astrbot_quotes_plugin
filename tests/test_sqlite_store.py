@@ -945,6 +945,20 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(broken_file.exists())
         self.assertFalse((session_dir / "quotes.json.migrated.bak").exists())
 
+    async def test_git_backup_snapshot_blocks_database_writes_until_staged(self) -> None:
+        repository = QuoteRepository(self.root)
+
+        async with repository.git_backup_snapshot():
+            pending_write = asyncio.create_task(
+                repository.create_binding("123456", "10001", "测试标签")
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(pending_write.done())
+
+        status, detail = await pending_write
+        self.assertEqual(status, "created")
+        self.assertEqual(detail, "测试标签")
+
 
 if __name__ == "__main__":
     unittest.main()

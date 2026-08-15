@@ -6,6 +6,36 @@
     "hint": "留空则自动使用 AstrBot 的 data/plugin_data/quotes/ 目录",
     "obvious_hint": true
   },
+  "git_backup": {
+    "description": "Git 自动备份",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": false,
+        "description": "启用自动备份",
+        "hint": "要求数据目录本身是已配置上游分支的独立 Git 仓库"
+      },
+      "interval_minutes": {
+        "type": "int",
+        "default": 1440,
+        "description": "备份间隔（分钟）",
+        "hint": "启用后会在插件启动时立即检查一次，之后按此间隔执行"
+      },
+      "commit_message": {
+        "type": "string",
+        "default": "chore: automatic quotes backup ({timestamp})",
+        "description": "自动提交信息",
+        "hint": "可使用 {timestamp} 插入带时区的本地时间"
+      },
+      "command_timeout_seconds": {
+        "type": "int",
+        "default": 120,
+        "description": "Git 命令超时（秒）",
+        "hint": "单条 git 命令超过该时间会终止，下一轮自动重试"
+      }
+    }
+  },
   "global_mode": {
     "description": "全局模式",
     "type": "bool",

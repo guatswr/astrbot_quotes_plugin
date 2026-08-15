@@ -137,6 +137,33 @@
 
 发送 `/语录存储检查` 可只读检查当前会话的语录、图库、图片和媒体资源，报告缺失文件、无效引用、引用计数不一致、孤儿文件以及标签/图库同名冲突。该命令不会修改或删除任何数据。
 
+### Git 自动备份
+
+开启 `git_backup.enabled` 后，插件会在启动时立即检查一次数据目录，随后按 `git_backup.interval_minutes` 定期执行以下流程：
+
+```text
+git add .
+git commit -m "配置的提交信息"
+git push
+```
+
+- 默认关闭；插件不会自动创建 Git 仓库、远程仓库或认证信息
+- 数据目录必须**本身就是独立 Git 仓库**，不能只位于 AstrBot 主仓库或其他父级 Git 仓库内
+- 当前分支必须已配置上游分支；首次启用前需手动完成 `git push -u <remote> <branch>`
+- 仅在存在文件变更时创建提交；若上次提交成功但推送失败，下一轮会继续尝试推送未同步提交
+- 提交信息支持 `{timestamp}` 占位符，例如默认值会生成带本地时间和时区的提交信息
+- 暂存前会暂停语录数据库写入并执行 SQLite WAL checkpoint，完成 `git add .` 后立即恢复正常写入
+- 不会自动执行 `git pull`、合并、变基或强制推送；远端冲突和认证问题只会写入日志，处理后由下一轮重试
+- Git 使用 AstrBot 运行环境中的凭据，请使用私有远程仓库，避免泄露群聊语录和用户数据
+
+建议在数据目录的 `.gitignore` 中排除可重新生成的缓存和 SQLite 临时文件：
+
+```gitignore
+groups/*/cache/
+*.sqlite3-wal
+*.sqlite3-shm
+```
+
 ### 戳一戳触发
 
 对 Bot 发送"戳一戳"（Poke）时，按配置的概率随机发送一条语录。
@@ -153,6 +180,10 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `storage` | 字符串 | `""` | 数据存储根目录，留空使用 AstrBot 默认目录 |
+| `git_backup.enabled` | 布尔 | `false` | 启用数据目录 Git 自动提交和推送 |
+| `git_backup.interval_minutes` | 整数 | `1440` | 自动备份间隔（分钟）；启用后启动时也会立即检查 |
+| `git_backup.commit_message` | 字符串 | `"chore: automatic quotes backup ({timestamp})"` | 自动提交信息，支持 `{timestamp}` |
+| `git_backup.command_timeout_seconds` | 整数 | `120` | 每条 Git 命令的超时时间（秒） |
 | `global_mode` | 布尔 | `false` | 全局模式：开启后随机语录在所有群/私聊间共享 |
 | `delete_permission` | 字符串 | `"管理员"` | 删除权限：群员 / 管理员 / 群主 / Bot管理员 |
 | `blacklist` | 列表 | `[]` | 拒绝上传语录的用户 QQ 号列表 |
@@ -177,6 +208,8 @@
 
 ```
 quotes/
+├── .git/                       # 可选；启用 Git 自动备份时必须位于数据目录本身
+├── .gitignore                  # 可选；建议排除 cache、WAL 与 SHM 临时文件
 ├── quotes.sqlite3              # 语录、标签映射、随机图库、资源元数据与已发送指纹索引
 └── groups/
     └── {session_key}/          # 群号 或 private_QQ号
