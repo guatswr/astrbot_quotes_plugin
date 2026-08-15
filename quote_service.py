@@ -101,7 +101,18 @@ class QuoteService:
         mention_qq = self.extract_at_qq(event) or ""
         raw_target = str(uid or "").strip()
         explicit_qq = raw_target if is_valid_qq(raw_target) else ""
-        gallery_keyword = raw_target if raw_target and not explicit_qq and not mention_qq else ""
+        tag_binding = (
+            self.repository.get_binding_by_tag(session_key, raw_target)
+            if raw_target and not explicit_qq and not mention_qq
+            else None
+        )
+        if tag_binding is not None:
+            explicit_qq = tag_binding.qq
+        gallery_keyword = (
+            raw_target
+            if raw_target and not explicit_qq and not mention_qq
+            else ""
+        )
 
         if gallery_keyword:
             return await self._add_gallery_images(
@@ -127,7 +138,7 @@ class QuoteService:
         current_segments = await self.image_service.build_current_segments(
             event,
             command_name="上传",
-            explicit_qq=explicit_qq,
+            explicit_qq=raw_target,
         )
         all_segments = self._normalize_pending_segments([*reply_segments, *current_segments])
         if not all_segments:
@@ -741,6 +752,58 @@ class QuoteService:
             f"{index}. {display_name}：{quote_count} 条"
             for index, (_, display_name, quote_count) in enumerate(rankings, start=1)
         )
+        return "\n".join(lines)
+
+    async def build_gallery_list_text(
+        self,
+        session_key: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> str:
+        safe_page = max(1, int(page))
+        safe_page_size = max(1, min(50, int(page_size)))
+        offset = (safe_page - 1) * safe_page_size
+        total, galleries = await asyncio.to_thread(
+            self.repository.list_galleries_page,
+            session_key,
+            limit=safe_page_size,
+            offset=offset,
+        )
+        if total == 0:
+            return "当前会话还没有随机图库。"
+
+        total_pages = (total + safe_page_size - 1) // safe_page_size
+        if safe_page > total_pages:
+            return f"页码超出范围：当前共有 {total_pages} 页、{total} 个图库。"
+
+        lines = [f"当前会话图库（第 {safe_page}/{total_pages} 页，共 {total} 个）："]
+        lines.extend(
+            f'{index}. “{keyword}”：{image_count} 张'
+            for index, (keyword, image_count) in enumerate(galleries, start=offset + 1)
+        )
+        if safe_page < total_pages:
+            lines.append(f"发送 /图库列表 {safe_page + 1} 查看下一页。")
+        return "\n".join(lines)
+
+    async def build_storage_audit_text(self, session_key: str) -> str:
+        audit = await self.repository.audit_storage(session_key)
+        status = "正常" if audit.healthy else f"发现 {audit.issue_count} 项异常"
+        lines = [
+            f"当前会话存储体检：{status}",
+            f"- 语录：{audit.quote_count} 条",
+            f"- 图库：{audit.gallery_count} 个，{audit.gallery_image_references} 个图片引用",
+            f"- 图片资产：{audit.image_asset_count} 个，{audit.image_references} 次引用",
+            f"- 媒体资产：{audit.media_asset_count} 个，{audit.media_references} 次引用",
+            (
+                "- 异常："
+                f"缺失文件 {audit.missing_image_files + audit.missing_media_files}，"
+                f"无效引用 {audit.missing_image_references + audit.missing_media_references}，"
+                f"引用计数不一致 {audit.image_ref_count_mismatches + audit.media_ref_count_mismatches}，"
+                f"孤儿文件 {audit.orphan_image_files + audit.orphan_media_files}，"
+                f"标签/图库同名 {audit.tag_gallery_name_collisions}"
+            ),
+            "本次仅检查，未修改任何文件或数据库记录。",
+        ]
         return "\n".join(lines)
 
     async def random_gallery_response(

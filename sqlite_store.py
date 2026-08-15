@@ -42,6 +42,7 @@ try:
         QuoteBinding,
         QuoteSegment,
         SentQuoteRecord,
+        StorageAuditResult,
     )
     from .store import CreateQuoteResult, QuoteRepository as JsonQuoteRepository
     from .utils import is_near_duplicate
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover
         QuoteBinding,
         QuoteSegment,
         SentQuoteRecord,
+        StorageAuditResult,
     )
     from store import CreateQuoteResult, QuoteRepository as JsonQuoteRepository
     from utils import is_near_duplicate
@@ -367,7 +369,6 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
     def _create_binding_sync(self, session_key: str, qq: str, tag: str) -> tuple[str, str]:
         connection = self._connect()
         try:
-            # Serialize selection and state replacement across repository instances.
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT * FROM quote_bindings WHERE session_key = ? AND qq = ?",
@@ -384,6 +385,17 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             if tag_owner is not None:
                 connection.rollback()
                 return "tag_exists", str(tag_owner["qq"])
+            gallery = connection.execute(
+                """
+                SELECT 1 FROM gallery_images
+                WHERE session_key = ? AND keyword = ?
+                LIMIT 1
+                """,
+                (session_key, tag),
+            ).fetchone()
+            if gallery is not None:
+                connection.rollback()
+                return "gallery_exists", tag
             now = time()
             connection.execute(
                 """
@@ -441,6 +453,17 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             if tag_owner is not None:
                 connection.rollback()
                 return "tag_exists", str(tag_owner["qq"])
+            gallery = connection.execute(
+                """
+                SELECT 1 FROM gallery_images
+                WHERE session_key = ? AND keyword = ?
+                LIMIT 1
+                """,
+                (session_key, tag),
+            ).fetchone()
+            if gallery is not None:
+                connection.rollback()
+                return "gallery_exists", tag
             connection.execute(
                 """
                 UPDATE quote_bindings
@@ -917,6 +940,146 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 ).fetchone()[0]
             )
 
+    def list_galleries_page(
+        self,
+        session_key: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[int, list[tuple[str, int]]]:
+        safe_limit = max(1, min(100, int(limit)))
+        safe_offset = max(0, int(offset))
+        with self._connection() as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT keyword) FROM gallery_images WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT keyword, COUNT(*) AS image_count
+                FROM gallery_images
+                WHERE session_key = ?
+                GROUP BY keyword
+                ORDER BY keyword
+                LIMIT ? OFFSET ?
+                """,
+                (session_key, safe_limit, safe_offset),
+            ).fetchall()
+        return total, [
+            (str(row["keyword"]), int(row["image_count"]))
+            for row in rows
+        ]
+
+    async def audit_storage(self, session_key: str) -> StorageAuditResult:
+        async with self._db_write_lock:
+            return await asyncio.to_thread(self._audit_storage_sync, session_key)
+
+    def _audit_storage_sync(self, session_key: str) -> StorageAuditResult:
+        with self._connection() as connection:
+            quote_rows = connection.execute(
+                """
+                SELECT image_ids_json, media_ids_json
+                FROM quotes WHERE session_key = ?
+                """,
+                (session_key,),
+            ).fetchall()
+            gallery_rows = connection.execute(
+                "SELECT keyword, asset_id FROM gallery_images WHERE session_key = ?",
+                (session_key,),
+            ).fetchall()
+            image_rows = connection.execute(
+                "SELECT asset_id, rel_path, ref_count FROM image_assets WHERE session_key = ?",
+                (session_key,),
+            ).fetchall()
+            media_rows = connection.execute(
+                "SELECT asset_id, rel_path, ref_count FROM media_assets WHERE session_key = ?",
+                (session_key,),
+            ).fetchall()
+            binding_rows = connection.execute(
+                "SELECT tag FROM quote_bindings WHERE session_key = ?",
+                (session_key,),
+            ).fetchall()
+
+        image_references: Counter[str] = Counter()
+        media_references: Counter[str] = Counter()
+        for row in quote_rows:
+            image_references.update(
+                str(asset_id)
+                for asset_id in _json_loads(row["image_ids_json"], [])
+                if str(asset_id)
+            )
+            media_references.update(
+                str(asset_id)
+                for asset_id in _json_loads(row["media_ids_json"], [])
+                if str(asset_id)
+            )
+
+        gallery_references = Counter(str(row["asset_id"]) for row in gallery_rows)
+        expected_image_references = image_references + gallery_references
+        image_assets = {str(row["asset_id"]): row for row in image_rows}
+        media_assets = {str(row["asset_id"]): row for row in media_rows}
+
+        tracked_image_paths = {
+            (self.root / str(row["rel_path"])).resolve()
+            for row in image_rows
+        }
+        tracked_media_paths = {
+            (self.root / str(row["rel_path"])).resolve()
+            for row in media_rows
+        }
+        session_root = self.groups_dir / session_key
+        images_dir = session_root / "images"
+        media_dir = session_root / "media"
+        physical_image_paths = {
+            path.resolve()
+            for path in images_dir.rglob("*")
+            if path.is_file()
+        }
+        physical_media_paths = {
+            path.resolve()
+            for path in media_dir.rglob("*")
+            if path.is_file()
+        }
+
+        return StorageAuditResult(
+            session_key=session_key,
+            quote_count=len(quote_rows),
+            gallery_count=len({str(row["keyword"]) for row in gallery_rows}),
+            gallery_image_references=sum(gallery_references.values()),
+            image_asset_count=len(image_rows),
+            image_references=sum(expected_image_references.values()),
+            media_asset_count=len(media_rows),
+            media_references=sum(media_references.values()),
+            missing_image_files=sum(not path.is_file() for path in tracked_image_paths),
+            missing_media_files=sum(not path.is_file() for path in tracked_media_paths),
+            missing_image_references=sum(
+                count
+                for asset_id, count in expected_image_references.items()
+                if asset_id not in image_assets
+            ),
+            missing_media_references=sum(
+                count
+                for asset_id, count in media_references.items()
+                if asset_id not in media_assets
+            ),
+            image_ref_count_mismatches=sum(
+                int(row["ref_count"]) != expected_image_references.get(asset_id, 0)
+                for asset_id, row in image_assets.items()
+            ),
+            media_ref_count_mismatches=sum(
+                int(row["ref_count"]) != media_references.get(asset_id, 0)
+                for asset_id, row in media_assets.items()
+            ),
+            orphan_image_files=len(physical_image_paths - tracked_image_paths),
+            orphan_media_files=len(physical_media_paths - tracked_media_paths),
+            tag_gallery_name_collisions=len(
+                {str(row["tag"]) for row in binding_rows}
+                & {str(row["keyword"]) for row in gallery_rows}
+            ),
+        )
+
     async def delete_gallery_image(
         self,
         session_key: str,
@@ -1052,6 +1215,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
             return None
         connection = self._connect()
         try:
+            # Serialize gallery selection and recent-history replacement across instances.
             connection.execute("BEGIN IMMEDIATE")
             keyword = text
             if connection.execute(
@@ -1220,12 +1384,14 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 for segment in segments
                 if segment.type == "image" and segment.image is not None
             ]
-            if self._has_duplicate(images, self._list_image_assets(connection, session_key)):
+            if self._has_duplicate(images, []):
                 connection.rollback()
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
             persisted_segments: list[QuoteSegment] = []
             created_assets: list[ImageAsset] = []
+            referenced_assets: list[ImageAsset] = []
+            existing_assets = self._list_image_assets(connection, session_key)
             created_at = time()
             for segment in segments:
                 if segment.type == "text":
@@ -1235,20 +1401,29 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                     continue
                 if segment.type != "image" or segment.image is None:
                     continue
-                asset = self._persist_image_asset(
-                    store,
-                    segment.image,
-                    created_at=created_at,
-                    created_files=created_files,
-                )
-                created_assets.append(asset)
+                asset = self._find_matching_image_asset(segment.image, existing_assets)
+                if asset is not None:
+                    connection.execute(
+                        "UPDATE image_assets SET ref_count = ref_count + 1 WHERE asset_id = ?",
+                        (asset.asset_id,),
+                    )
+                else:
+                    asset = self._persist_image_asset(
+                        store,
+                        segment.image,
+                        created_at=created_at,
+                        created_files=created_files,
+                    )
+                    created_assets.append(asset)
+                    existing_assets.append(asset)
+                referenced_assets.append(asset)
                 persisted_segments.append(QuoteSegment(type="image", asset_id=asset.asset_id))
 
             quote.kind = "standard"
             quote.group = session_key
             quote.forward_nodes = []
             quote.segments = persisted_segments
-            quote.image_ids = [asset.asset_id for asset in created_assets]
+            quote.image_ids = [asset.asset_id for asset in referenced_assets]
             quote.media_ids = []
             if not quote.text:
                 quote.text = " ".join(
@@ -1301,12 +1476,23 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
         try:
             connection.execute("BEGIN IMMEDIATE")
             images = self._collect_pending_forward_images(nodes)
-            if self._has_duplicate(images, self._list_image_assets(connection, session_key)):
+            if self._has_duplicate(images, []):
                 connection.rollback()
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
             created_image_assets: list[ImageAsset] = []
             created_media_assets: list[MediaAsset] = []
+            existing_assets = self._list_image_assets(connection, session_key)
+
+            def reuse_image(image: PreparedImage) -> ImageAsset | None:
+                asset = self._find_matching_image_asset(image, existing_assets)
+                if asset is not None:
+                    connection.execute(
+                        "UPDATE image_assets SET ref_count = ref_count + 1 WHERE asset_id = ?",
+                        (asset.asset_id,),
+                    )
+                return asset
+
             persisted_nodes, image_ids, media_ids = self._persist_forward_nodes(
                 store,
                 nodes,
@@ -1314,6 +1500,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
                 created_media_assets=created_media_assets,
                 created_files=created_files,
                 created_at=time(),
+                reuse_image=reuse_image,
             )
             quote.kind = "forward"
             quote.group = session_key
@@ -1380,6 +1567,7 @@ class SQLiteQuoteRepository(JsonQuoteRepository):
 
         connection = self._connect()
         try:
+            # Serialize quote selection and state replacement across repository instances.
             connection.execute("BEGIN IMMEDIATE")
             state = connection.execute(
                 "SELECT quote_id FROM quote_random_state WHERE session_key = ?",

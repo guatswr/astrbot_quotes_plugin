@@ -287,6 +287,47 @@ class QuoteBinding:
 
 
 @dataclass(slots=True)
+class StorageAuditResult:
+    session_key: str
+    quote_count: int = 0
+    gallery_count: int = 0
+    gallery_image_references: int = 0
+    image_asset_count: int = 0
+    image_references: int = 0
+    media_asset_count: int = 0
+    media_references: int = 0
+    missing_image_files: int = 0
+    missing_media_files: int = 0
+    missing_image_references: int = 0
+    missing_media_references: int = 0
+    image_ref_count_mismatches: int = 0
+    media_ref_count_mismatches: int = 0
+    orphan_image_files: int = 0
+    orphan_media_files: int = 0
+    tag_gallery_name_collisions: int = 0
+
+    @property
+    def issue_count(self) -> int:
+        return sum(
+            (
+                self.missing_image_files,
+                self.missing_media_files,
+                self.missing_image_references,
+                self.missing_media_references,
+                self.image_ref_count_mismatches,
+                self.media_ref_count_mismatches,
+                self.orphan_image_files,
+                self.orphan_media_files,
+                self.tag_gallery_name_collisions,
+            )
+        )
+
+    @property
+    def healthy(self) -> bool:
+        return self.issue_count == 0
+
+
+@dataclass(slots=True)
 class PreparedImage:
     content: bytes
     extension: str

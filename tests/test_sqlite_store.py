@@ -366,7 +366,41 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             ),
             [PendingQuoteSegment(type="image", image=prepared_image)],
         )
-        self.assertTrue(duplicate_result.duplicate)
+        self.assertFalse(duplicate_result.duplicate)
+        self.assertEqual(image_quote.image_ids, duplicate_result.quote.image_ids)
+        self.assertEqual(
+            repository.find_asset("123456", image_quote.image_ids[0]).ref_count,
+            2,
+        )
+
+        forward_image_quote = Quote(
+            id="q_forward_image",
+            qq="10004",
+            name="聊天记录图片用户",
+            text="",
+            created_by="20002",
+            created_at=32.0,
+            group="123456",
+            kind="forward",
+            content_fingerprint="forward-image-fingerprint",
+        )
+        forward_image_result = await repository.create_quote_with_forward_nodes(
+            "123456",
+            forward_image_quote,
+            [
+                PendingForwardNode(
+                    sender_uin="10004",
+                    sender_name="聊天记录图片用户",
+                    segments=[PendingForwardSegment(type="image", image=prepared_image)],
+                )
+            ],
+        )
+        self.assertIsNotNone(forward_image_result.quote)
+        self.assertEqual(forward_image_quote.image_ids, image_quote.image_ids)
+        self.assertEqual(
+            repository.find_asset("123456", image_quote.image_ids[0]).ref_count,
+            3,
+        )
 
         media = PreparedMedia(
             content=b"audio-content",
@@ -405,6 +439,10 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(media_path.exists())
 
         self.assertTrue(await repository.delete_quote("q_image"))
+        self.assertTrue(image_path.exists())
+        self.assertTrue(await repository.delete_quote("q_image_duplicate"))
+        self.assertTrue(image_path.exists())
+        self.assertTrue(await repository.delete_quote("q_forward_image"))
         self.assertFalse(image_path.exists())
         self.assertTrue(await repository.delete_quote("q_forward"))
         self.assertFalse(media_path.exists())
@@ -483,6 +521,10 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
             await repository.add_gallery_images("123456", "猫猫", [prepared_image]),
             (1, 0),
         )
+        self.assertEqual(
+            await repository.create_binding("123456", "10001", "猫"),
+            ("gallery_exists", "猫"),
+        )
 
         selected = await repository.random_gallery_image("123456", "  猫猫  ")
         self.assertIsNotNone(selected)
@@ -495,6 +537,90 @@ class SQLiteQuoteRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await repository.random_gallery_image("123456", "今天想看看猫猫"))
         self.assertIsNone(await repository.random_gallery_image("123456", "没有命中"))
         self.assertEqual(repository.list_quotes("123456"), [])
+        total, first_page = repository.list_galleries_page(
+            "123456",
+            limit=1,
+            offset=0,
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual(first_page, [("猫", 1)])
+
+        gallery_asset = selected[1]
+        quote = Quote(
+            id="q_reuse_gallery_asset",
+            qq="10002",
+            name="复用用户",
+            text="",
+            created_by="20002",
+            created_at=1.0,
+            group="123456",
+            content_fingerprint="reuse-gallery-asset",
+        )
+        result = await repository.create_quote_with_segments(
+            "123456",
+            quote,
+            [PendingQuoteSegment(type="image", image=prepared_image)],
+        )
+        self.assertIsNotNone(result.quote)
+        self.assertEqual(quote.image_ids, [gallery_asset.asset_id])
+        self.assertEqual(
+            repository.find_asset("123456", gallery_asset.asset_id).ref_count,
+            3,
+        )
+        self.assertTrue(await repository.delete_quote(quote.id))
+        self.assertEqual(
+            repository.find_asset("123456", gallery_asset.asset_id).ref_count,
+            2,
+        )
+
+    async def test_storage_audit_reports_missing_mismatched_and_orphan_files(self) -> None:
+        repository = QuoteRepository(self.root)
+        source = BytesIO()
+        PillowImage.new("RGB", (48, 32), (15, 30, 45)).save(source, format="PNG")
+        prepared_image = prepare_image(source.getvalue(), source="audit.png")
+        quote = Quote(
+            id="q_audit",
+            qq="10001",
+            name="检查用户",
+            text="",
+            created_by="20002",
+            created_at=1.0,
+            group="123456",
+            content_fingerprint="audit-fingerprint",
+        )
+        await repository.create_quote_with_segments(
+            "123456",
+            quote,
+            [PendingQuoteSegment(type="image", image=prepared_image)],
+        )
+        await repository.add_gallery_images("123456", "检查图库", [prepared_image])
+
+        healthy = await repository.audit_storage("123456")
+        self.assertTrue(healthy.healthy)
+        self.assertEqual(healthy.quote_count, 1)
+        self.assertEqual(healthy.gallery_count, 1)
+        self.assertEqual(healthy.image_asset_count, 1)
+        self.assertEqual(healthy.image_references, 2)
+
+        asset = repository.find_asset("123456", quote.image_ids[0])
+        (self.root / asset.rel_path).unlink()
+        orphan_path = repository.get_store("123456").images_dir / "orphan.jpg"
+        orphan_path.write_bytes(b"orphan")
+        connection = sqlite3.connect(self.root / DATABASE_FILENAME)
+        try:
+            connection.execute(
+                "UPDATE image_assets SET ref_count = 99 WHERE asset_id = ?",
+                (asset.asset_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        unhealthy = await repository.audit_storage("123456")
+        self.assertFalse(unhealthy.healthy)
+        self.assertEqual(unhealthy.missing_image_files, 1)
+        self.assertEqual(unhealthy.image_ref_count_mismatches, 1)
+        self.assertEqual(unhealthy.orphan_image_files, 1)
 
     async def test_gallery_random_avoids_recent_images(self) -> None:
         repository = QuoteRepository(self.root)

@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Any
+from typing import Any, Callable
 
 try:
     from astrbot.api import logger
@@ -383,13 +383,14 @@ class QuoteRepository:
             quotes = store.load_quotes()
             assets = store.load_assets()
             images = [segment.image for segment in segments if segment.type == "image" and segment.image is not None]
-            if self._has_duplicate(images, assets):
+            if self._has_duplicate(images, []):
                 logger.info(f"存储语录失败: 图片重复, session={session_key}, quote_id={quote.id}, images={len(images)}")
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
             from time import time
 
             created_assets: list[ImageAsset] = []
+            referenced_assets: list[ImageAsset] = []
             created_files: list[Path] = []
             try:
                 persisted_segments: list[QuoteSegment] = []
@@ -404,19 +405,24 @@ class QuoteRepository:
                     if segment.type != "image" or image is None:
                         continue
 
-                    asset = self._persist_image_asset(
-                        store,
-                        image,
-                        created_at=time(),
-                        created_files=created_files,
-                    )
-                    created_assets.append(asset)
+                    asset = self._find_matching_image_asset(image, assets)
+                    if asset is not None:
+                        asset.ref_count += 1
+                    else:
+                        asset = self._persist_image_asset(
+                            store,
+                            image,
+                            created_at=time(),
+                            created_files=created_files,
+                        )
+                        created_assets.append(asset)
+                    referenced_assets.append(asset)
                     persisted_segments.append(QuoteSegment(type="image", asset_id=asset.asset_id))
 
                 quote.kind = "standard"
                 quote.forward_nodes = []
                 quote.segments = persisted_segments
-                quote.image_ids = [item.asset_id for item in created_assets]
+                quote.image_ids = [item.asset_id for item in referenced_assets]
                 quote.media_ids = []
                 if not quote.text:
                     quote.text = " ".join(
@@ -445,7 +451,7 @@ class QuoteRepository:
             image_assets = store.load_assets()
             media_assets = store.load_media_assets()
             images = self._collect_pending_forward_images(nodes)
-            if self._has_duplicate(images, image_assets):
+            if self._has_duplicate(images, []):
                 logger.info(f"存储聊天记录语录失败: 图片重复, session={session_key}, quote_id={quote.id}, images={len(images)}")
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
@@ -454,6 +460,13 @@ class QuoteRepository:
             created_image_assets: list[ImageAsset] = []
             created_media_assets: list[MediaAsset] = []
             created_files: list[Path] = []
+
+            def reuse_image(image: PreparedImage) -> ImageAsset | None:
+                asset = self._find_matching_image_asset(image, image_assets)
+                if asset is not None:
+                    asset.ref_count += 1
+                return asset
+
             try:
                 persisted_nodes, image_ids, media_ids = self._persist_forward_nodes(
                     store,
@@ -462,6 +475,7 @@ class QuoteRepository:
                     created_media_assets=created_media_assets,
                     created_files=created_files,
                     created_at=time(),
+                    reuse_image=reuse_image,
                 )
                 quote.kind = "forward"
                 quote.segments = []
@@ -689,6 +703,7 @@ class QuoteRepository:
         created_media_assets: list[MediaAsset],
         created_files: list[Path],
         created_at: float,
+        reuse_image: Callable[[PreparedImage], ImageAsset | None] | None = None,
     ) -> tuple[list[ForwardNode], list[str], list[str]]:
         persisted_nodes: list[ForwardNode] = []
         image_ids: list[str] = []
@@ -707,13 +722,15 @@ class QuoteRepository:
                     if segment.image is None:
                         persisted_segments.append(ForwardSegment(type="text", text="[图片]"))
                         continue
-                    asset = self._persist_image_asset(
-                        store,
-                        segment.image,
-                        created_at=created_at,
-                        created_files=created_files,
-                    )
-                    created_image_assets.append(asset)
+                    asset = reuse_image(segment.image) if reuse_image is not None else None
+                    if asset is None:
+                        asset = self._persist_image_asset(
+                            store,
+                            segment.image,
+                            created_at=created_at,
+                            created_files=created_files,
+                        )
+                        created_image_assets.append(asset)
                     image_ids.append(asset.asset_id)
                     persisted_segments.append(ForwardSegment(type="image", asset_id=asset.asset_id))
                     continue
@@ -755,6 +772,7 @@ class QuoteRepository:
                         created_media_assets=created_media_assets,
                         created_files=created_files,
                         created_at=created_at,
+                        reuse_image=reuse_image,
                     )
                     if nested_nodes:
                         image_ids.extend(nested_image_ids)
@@ -880,6 +898,26 @@ class QuoteRepository:
                 ):
                     return True
         return False
+
+    def _find_matching_image_asset(
+        self,
+        image: PreparedImage,
+        assets: list[ImageAsset],
+    ) -> ImageAsset | None:
+        return next(
+            (
+                asset
+                for asset in assets
+                if is_near_duplicate(
+                    image,
+                    asset.sha256,
+                    asset.dhash,
+                    asset.width,
+                    asset.height,
+                )
+            ),
+            None,
+        )
 
     def _resolve_legacy_image_path(self, raw_path: str) -> Path | None:
         if not raw_path:

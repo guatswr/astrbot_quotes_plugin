@@ -450,6 +450,61 @@ class PreRenderTests(unittest.IsolatedAsyncioTestCase):
                 await service.shutdown()
                 quote_service_module.Comp = original_components
 
+    async def test_upload_by_existing_tag_targets_bound_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = QuoteRepository(root)
+            await repository.create_binding("123456", "10001", "名言")
+            service = QuoteService(
+                repository=repository,
+                image_service=GalleryImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=CapturingRenderer(root / "unused.png"),
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+            try:
+                response = await service.add_quote(FakeEvent(), uid="名言")
+
+                self.assertEqual(response.text, "我学会啦，来问问我吧！高性能ですから~")
+                quotes = repository.list_quotes("123456")
+                self.assertEqual(len(quotes), 1)
+                self.assertEqual(quotes[0].qq, "10001")
+                self.assertEqual(repository.gallery_image_count("123456", "名言"), 0)
+            finally:
+                await service.shutdown()
+
+    async def test_gallery_list_and_storage_audit_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = QuoteRepository(root)
+            service = QuoteService(
+                repository=repository,
+                image_service=GalleryImageService(),
+                napcat_service=FakeNapcatService(),
+                renderer=CapturingRenderer(root / "unused.png"),
+                http_client=None,
+                global_mode=False,
+                text_mode=False,
+                render_cache=True,
+                image_signature_use_group=False,
+                blacklist=set(),
+            )
+            try:
+                await service.add_quote(FakeEvent(), uid="测试图库")
+
+                gallery_text = await service.build_gallery_list_text("123456")
+                self.assertIn('“测试图库”：1 张', gallery_text)
+                audit_text = await service.build_storage_audit_text("123456")
+                self.assertIn("当前会话存储体检：正常", audit_text)
+                self.assertIn("本次仅检查", audit_text)
+            finally:
+                await service.shutdown()
+
     async def test_missing_owner_quote_uses_memory_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

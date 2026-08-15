@@ -139,6 +139,19 @@ class QuotesPlugin(Star):
         text = await self.quote_service.build_quote_ranking_text(self._session_key(event))
         yield event.plain_result(text)
 
+    @filter.command("图库列表")
+    async def list_galleries(self, event: AstrMessageEvent, page: int = 1):
+        text = await self.quote_service.build_gallery_list_text(
+            self._session_key(event),
+            page=page,
+        )
+        yield event.plain_result(text)
+
+    @filter.command("语录存储检查")
+    async def audit_quote_storage(self, event: AstrMessageEvent):
+        text = await self.quote_service.build_storage_audit_text(self._session_key(event))
+        yield event.plain_result(text)
+
     @filter.command("语录缓存清理")
     async def clear_quote_cache(self, event: AstrMessageEvent):
         removed, failed = await self.quote_service.clear_render_cache(self._session_key(event))
@@ -218,11 +231,12 @@ class QuotesPlugin(Star):
     async def help_quote(self, event: AstrMessageEvent):
         help_text = (
             "语录插件帮助\n"
-            "- 上传：回复消息后发送，保存为语录；可用“上传 @某人”或“上传 QQ号”指定归属。\n"
+            "- 上传：回复消息后发送，保存为语录；可用“上传 @某人”“上传 QQ号”或已有标签指定归属。\n"
             "- 上传 图库关键词：回复或附带图片建立随机图库，发送完全相同的纯文本时随机发图。\n"
             "- 语录：随机发送语录；可用“语录 @某人”或“语录 QQ号”指定用户。\n"
             "- 语录列表 [页码]：按最新优先查看当前会话的语录。\n"
             "- 语录排名：按已收录语录数量排名，已绑定用户显示其 tag。\n"
+            "- 图库列表 [页码]：分页查看当前会话的图库及图片数量。\n"
             "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
             "- 图库图片删除 关键词：回复机器人发送的图库图片后删除单张。\n"
             "- 图库删除 关键词：管理员二次确认后删除整个图库。\n"
@@ -230,6 +244,7 @@ class QuotesPlugin(Star):
             "- 绑定列表：查看当前会话映射；重新绑定 @某人 [tag]：修改或取消映射。\n"
             "- 频率限制：每人在当前会话 2 分钟内最多触发 4 次语录或图库。\n"
             "- 语录缓存清理：清理当前会话的语录渲染缓存。\n"
+            "- 语录存储检查：只读检查资源引用、缺失文件和孤儿文件。\n"
             "- 语录帮助：查看本帮助。"
         )
         yield event.plain_result(help_text)
@@ -267,6 +282,10 @@ class QuotesPlugin(Star):
             yield event.plain_result(f'@{qq} 已绑定到“{detail}”，请使用 /重新绑定 修改。')
         elif status == "tag_exists":
             yield event.plain_result(f'标签“{resolved_tag}”已绑定到 @{detail}。')
+        elif status == "gallery_exists":
+            yield event.plain_result(
+                f'当前会话已存在同名图库“{detail}”，请更换标签或先删除该图库。'
+            )
         else:
             yield event.plain_result("绑定失败，请稍后重试。")
 
@@ -299,6 +318,10 @@ class QuotesPlugin(Star):
             yield event.plain_result(f'@{qq} 尚未绑定，请先使用 /绑定。')
         elif status == "tag_exists":
             yield event.plain_result(f'标签“{resolved_tag}”已绑定到 @{detail}。')
+        elif status == "gallery_exists":
+            yield event.plain_result(
+                f'当前会话已存在同名图库“{detail}”，请更换标签或先删除该图库。'
+            )
         else:
             yield event.plain_result("重新绑定失败，请稍后重试。")
 
