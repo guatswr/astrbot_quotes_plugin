@@ -183,9 +183,21 @@ class QuotesPlugin(Star):
         if not self._is_bot_admin(event):
             yield event.plain_result("权限不足：手动语录备份仅限 Bot 管理员使用。")
             return
-        result = await self.git_backup.backup_once()
+        logger.info(
+            "Bot 管理员手动触发 Git 备份: "
+            f"sender={event.get_sender_id()}, session={self._session_key(event)}"
+        )
+        yield event.plain_result("已开始执行语录备份，完成后会返回最终结果，请稍候……")
+        try:
+            result = await self.git_backup.backup_once()
+        except Exception as exc:
+            logger.error(f"手动 Git 备份异常: {exc}")
+            yield event.plain_result(f"语录备份异常中止：{exc}")
+            return
         if result.status == "error":
             logger.warning(f"手动 Git 备份失败: {result.message}")
+        else:
+            logger.info(f"手动 Git 备份完成: status={result.status}")
         yield event.plain_result(result.command_message)
 
     @filter.command("语录缓存清理")

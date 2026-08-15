@@ -103,6 +103,7 @@ class GitBackupService:
             return await self._backup_once_locked()
 
     async def _backup_once_locked(self) -> GitBackupResult:
+        logger.info(f"Git 备份开始检查: path={self.data_root}")
         repository_check = await self._run_git("rev-parse", "--show-toplevel")
         if repository_check.returncode != 0:
             return self._error_result(
@@ -131,6 +132,8 @@ class GitBackupService:
                 "当前分支未配置上游分支，请先手动执行一次 git push -u",
                 upstream,
             )
+        upstream_name = upstream.stdout.strip()
+        logger.info(f"Git 备份仓库检查完成: upstream={upstream_name}")
 
         commit_needed = False
         try:
@@ -140,9 +143,11 @@ class GitBackupService:
                     return self._error_result("检查 Git 变更失败", status)
 
                 if status.stdout.strip():
+                    logger.info("Git 备份检测到数据变更，执行 git add .")
                     added = await self._run_git("add", ".")
                     if added.returncode != 0:
                         return self._error_result("git add . 失败", added)
+                    logger.info("Git 备份 git add . 完成")
 
                     staged = await self._run_git("diff", "--cached", "--quiet")
                     if staged.returncode == 1:
@@ -155,16 +160,18 @@ class GitBackupService:
         committed = False
         if commit_needed:
             message = self._render_commit_message()
+            logger.info("Git 备份执行 git commit")
             commit = await self._run_git("commit", "-m", message)
             if commit.returncode != 0:
                 return self._error_result("git commit 失败", commit)
             committed = True
+            logger.info("Git 备份 git commit 完成")
 
         if not committed:
             ahead = await self._run_git(
                 "rev-list",
                 "--count",
-                f"{upstream.stdout.strip()}..HEAD",
+                f"{upstream_name}..HEAD",
             )
             if ahead.returncode != 0:
                 return self._error_result("检查待推送提交失败", ahead)
@@ -172,9 +179,11 @@ class GitBackupService:
                 ahead_count = int(ahead.stdout.strip() or "0")
             except ValueError:
                 return GitBackupResult("error", "Git 返回了无效的待推送提交数量。")
+            logger.info(f"Git 备份待推送提交检查完成: ahead={ahead_count}")
             if ahead_count <= 0:
                 return GitBackupResult("unchanged", "数据目录没有需要备份的变更。")
 
+        logger.info(f"Git 备份执行 git push: upstream={upstream_name}")
         pushed = await self._run_git("push")
         if pushed.returncode != 0:
             result = self._error_result("git push 失败", pushed)
@@ -184,6 +193,7 @@ class GitBackupService:
                 committed=committed,
                 pushed=False,
             )
+        logger.info(f"Git 备份 git push 完成: upstream={upstream_name}")
         return GitBackupResult(
             "pushed",
             "Git 自动备份已提交并推送。" if committed else "待推送的备份提交已推送。",

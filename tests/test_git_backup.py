@@ -121,6 +121,7 @@ class GitBackupServiceTests(unittest.IsolatedAsyncioTestCase):
         commit_call = next(call for call in calls if call[:2] == ("commit", "-m"))
         self.assertNotIn("{timestamp}", commit_call[2])
         self.assertTrue(commit_call[2].startswith("backup "))
+        self.assertEqual(calls.count(("push",)), 1)
         self.assertEqual(calls[-1], ("push",))
 
     async def test_unpushed_commit_is_retried_without_new_changes(self) -> None:
